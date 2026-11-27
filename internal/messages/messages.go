@@ -18,6 +18,31 @@ const MaxPageSize = 100
 
 var ErrInvalid = errors.New("invalid message")
 var ErrRecipient = errors.New("recipient not available")
+var ErrNotFound = errors.New("message not found")
+var ErrExpired = errors.New("edit window expired")
+
+// ChangeWindow is how long after sending a message can be edited or deleted.
+const ChangeWindow = 5 * time.Minute
+
+// changeWindowSQL limits edits and deletions using the database clock.
+const changeWindowSQL = `created_at > NOW() - make_interval(secs => 300)`
+
+// changeError explains why a change matched no row: the message is not the
+// user's (or is deleted), it is past the window, or otherwise the input was invalid.
+func (s Store) changeError(ctx context.Context, userID string, messageID int64) error {
+	var inWindow bool
+	err := s.DB.QueryRowContext(ctx, `SELECT `+changeWindowSQL+` FROM direct_messages WHERE id=$1 AND sender_id=$2 AND deleted_at IS NULL`, messageID, userID).Scan(&inWindow)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return ErrNotFound
+	case err != nil:
+		return err
+	case !inWindow:
+		return ErrExpired
+	default:
+		return ErrInvalid
+	}
+}
 
 type Message struct {
 	ID          int64       `json:"id"`
@@ -27,6 +52,8 @@ type Message struct {
 	Attachment  *Attachment `json:"attachment"`
 	CreatedAt   time.Time   `json:"createdAt"`
 	ReadAt      *time.Time  `json:"readAt"`
+	EditedAt    *time.Time  `json:"editedAt"`
+	DeletedAt   *time.Time  `json:"deletedAt"`
 }
 
 // Attachment is an image or document stored on disk; FileName never leaves the server.
@@ -76,30 +103,38 @@ func (s Store) Migrate(ctx context.Context) error {
 		ADD COLUMN IF NOT EXISTS attachment_width INT,
 		ADD COLUMN IF NOT EXISTS attachment_height INT,
 		ADD COLUMN IF NOT EXISTS attachment_original_name TEXT,
-		ADD COLUMN IF NOT EXISTS attachment_size BIGINT;
+		ADD COLUMN IF NOT EXISTS attachment_size BIGINT,
+		ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ,
+		ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 	DO $$ BEGIN
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='direct_messages_content_check') THEN
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='direct_messages_content_v2_check') THEN
 			ALTER TABLE direct_messages DROP CONSTRAINT IF EXISTS direct_messages_body_check;
-			ALTER TABLE direct_messages ADD CONSTRAINT direct_messages_content_check CHECK (
-				char_length(body) <= 4000 AND (char_length(body) > 0 OR attachment_name IS NOT NULL));
+			ALTER TABLE direct_messages DROP CONSTRAINT IF EXISTS direct_messages_content_check;
+			ALTER TABLE direct_messages ADD CONSTRAINT direct_messages_content_v2_check CHECK (
+				char_length(body) <= 4000 AND (deleted_at IS NOT NULL OR char_length(body) > 0 OR attachment_name IS NOT NULL));
 		END IF;
 	END $$;`)
 	return err
 }
 
-const columns = `id,sender_id,recipient_id,body,created_at,read_at,attachment_name,attachment_type,attachment_width,attachment_height,attachment_original_name,attachment_size`
+const columns = `id,sender_id,recipient_id,body,created_at,read_at,attachment_name,attachment_type,attachment_width,attachment_height,attachment_original_name,attachment_size,edited_at,deleted_at`
 
 func scanInto(row interface{ Scan(...any) error }, m *Message, extra ...any) error {
-	var readAt sql.NullTime
+	var readAt, editedAt, deletedAt sql.NullTime
 	var name, contentType, original sql.NullString
 	var width, height, size sql.NullInt64
-	dest := append([]any{&m.ID, &m.SenderID, &m.RecipientID, &m.Body, &m.CreatedAt, &readAt, &name, &contentType, &width, &height, &original, &size}, extra...)
+	dest := append([]any{&m.ID, &m.SenderID, &m.RecipientID, &m.Body, &m.CreatedAt, &readAt, &name, &contentType, &width, &height, &original, &size, &editedAt, &deletedAt}, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return err
 	}
-	if readAt.Valid {
-		v := readAt.Time
-		m.ReadAt = &v
+	for _, t := range []struct {
+		src sql.NullTime
+		dst **time.Time
+	}{{readAt, &m.ReadAt}, {editedAt, &m.EditedAt}, {deletedAt, &m.DeletedAt}} {
+		if t.src.Valid {
+			v := t.src.Time
+			*t.dst = &v
+		}
 	}
 	if name.Valid {
 		a := &Attachment{FileName: name.String, Kind: "file", ContentType: contentType.String, Name: original.String, Size: size.Int64, Width: int(width.Int64), Height: int(height.Int64), URL: "/api/messages/" + strconv.FormatInt(m.ID, 10) + "/attachment"}
@@ -202,6 +237,44 @@ func (s Store) History(ctx context.Context, userID, contactID string, before int
 	return list, rows.Err()
 }
 
+// Edit changes the text (or caption) of a message the user sent within ChangeWindow.
+func (s Store) Edit(ctx context.Context, userID string, messageID int64, body string) (Message, error) {
+	body = strings.TrimSpace(strings.ReplaceAll(body, "\r\n", "\n"))
+	if !utf8.ValidString(body) || utf8.RuneCountInString(body) > MaxBodyRunes {
+		return Message{}, ErrInvalid
+	}
+	m, err := scan(s.DB.QueryRowContext(ctx, `UPDATE direct_messages SET body=$3,
+		edited_at=CASE WHEN body=$3 THEN edited_at ELSE NOW() END
+		WHERE id=$1 AND sender_id=$2 AND deleted_at IS NULL AND ($3<>'' OR attachment_name IS NOT NULL) AND `+changeWindowSQL+`
+		RETURNING `+columns, messageID, userID, body))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Message{}, s.changeError(ctx, userID, messageID)
+	}
+	return m, err
+}
+
+// Delete removes a message the user sent within ChangeWindow for both people. The returned file
+// name, if any, is the attachment the caller should remove from disk.
+func (s Store) Delete(ctx context.Context, userID string, messageID int64) (Message, string, error) {
+	var m Message
+	var file sql.NullString
+	err := scanInto(s.DB.QueryRowContext(ctx, `WITH old AS (
+			SELECT id, attachment_name FROM direct_messages WHERE id=$1 AND sender_id=$2 AND deleted_at IS NULL AND `+changeWindowSQL+` FOR UPDATE
+		)
+		UPDATE direct_messages m SET body='', deleted_at=NOW(), edited_at=NULL, attachment_name=NULL, attachment_type=NULL,
+			attachment_width=NULL, attachment_height=NULL, attachment_original_name=NULL, attachment_size=NULL
+		FROM old WHERE m.id=old.id
+		RETURNING m.id,m.sender_id,m.recipient_id,m.body,m.created_at,m.read_at,m.attachment_name,m.attachment_type,m.attachment_width,
+			m.attachment_height,m.attachment_original_name,m.attachment_size,m.edited_at,m.deleted_at,old.attachment_name`, messageID, userID), &m, &file)
+	if errors.Is(err, sql.ErrNoRows) {
+		if cause := s.changeError(ctx, userID, messageID); cause != ErrInvalid {
+			return Message{}, "", cause
+		}
+		return Message{}, "", ErrNotFound
+	}
+	return m, file.String, err
+}
+
 // Attachment returns a message's image if the user took part in the conversation.
 func (s Store) Attachment(ctx context.Context, userID string, messageID int64) (Attachment, error) {
 	m, err := scan(s.DB.QueryRowContext(ctx, `SELECT `+columns+` FROM direct_messages WHERE id=$1 AND (sender_id=$2 OR recipient_id=$2)`, messageID, userID))
@@ -230,8 +303,9 @@ func (s Store) MarkRead(ctx context.Context, userID, contactID string) (time.Tim
 // active contact the user has exchanged messages with.
 func (s Store) Conversations(ctx context.Context, userID string) ([]Conversation, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT ON (mine.other) mine.id,mine.sender_id,mine.recipient_id,mine.body,mine.created_at,mine.read_at,
-		mine.attachment_name,mine.attachment_type,mine.attachment_width,mine.attachment_height,mine.attachment_original_name,mine.attachment_size,mine.other,
-		(SELECT COUNT(*) FROM direct_messages u WHERE u.recipient_id=$1 AND u.sender_id=mine.other AND u.read_at IS NULL)
+		mine.attachment_name,mine.attachment_type,mine.attachment_width,mine.attachment_height,mine.attachment_original_name,mine.attachment_size,
+		mine.edited_at,mine.deleted_at,mine.other,
+		(SELECT COUNT(*) FROM direct_messages u WHERE u.recipient_id=$1 AND u.sender_id=mine.other AND u.read_at IS NULL AND u.deleted_at IS NULL)
 		FROM (SELECT m.*, CASE WHEN m.sender_id=$1 THEN m.recipient_id ELSE m.sender_id END AS other
 			FROM direct_messages m WHERE m.sender_id=$1 OR m.recipient_id=$1) mine
 		JOIN users ON users.id=mine.other AND users.account_status='active'

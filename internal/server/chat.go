@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -120,6 +121,83 @@ func (s *Server) sendMessage(c *gin.Context) {
 	}
 	s.hub.emit(messageEvent{Type: "message", Message: m}, m.SenderID, m.RecipientID)
 	c.JSON(http.StatusCreated, m)
+}
+
+func messageID(c *gin.Context) (int64, bool) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id < 1 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Mensagem não encontrada."})
+		return 0, false
+	}
+	return id, true
+}
+
+func (s *Server) editMessage(c *gin.Context) {
+	if !s.sameOrigin(c) {
+		return
+	}
+	u, ok := s.currentUser(c)
+	if !ok {
+		return
+	}
+	id, ok := messageID(c)
+	if !ok {
+		return
+	}
+	var body struct {
+		Body string `json:"body"`
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
+	if c.ShouldBindJSON(&body) != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Dados inválidos."})
+		return
+	}
+	m, err := s.messages.Edit(c.Request.Context(), u.ID, id, body.Body)
+	switch {
+	case errors.Is(err, messages.ErrInvalid):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "A mensagem precisa ter entre 1 e 4000 caracteres."})
+	case errors.Is(err, messages.ErrExpired):
+		c.JSON(http.StatusForbidden, gin.H{"error": "O prazo de 5 minutos para editar esta mensagem terminou."})
+	case errors.Is(err, messages.ErrNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "Você só pode editar mensagens suas que não foram apagadas."})
+	case err != nil:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível editar a mensagem."})
+	default:
+		s.hub.emit(messageEvent{Type: "message_updated", Message: m}, m.SenderID, m.RecipientID)
+		c.JSON(http.StatusOK, m)
+	}
+}
+
+func (s *Server) deleteMessage(c *gin.Context) {
+	if !s.sameOrigin(c) {
+		return
+	}
+	u, ok := s.currentUser(c)
+	if !ok {
+		return
+	}
+	id, ok := messageID(c)
+	if !ok {
+		return
+	}
+	m, file, err := s.messages.Delete(c.Request.Context(), u.ID, id)
+	if errors.Is(err, messages.ErrExpired) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "O prazo de 5 minutos para apagar esta mensagem terminou."})
+		return
+	}
+	if errors.Is(err, messages.ErrNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Você só pode apagar mensagens suas."})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível apagar a mensagem."})
+		return
+	}
+	if file != "" {
+		_ = os.Remove(filepath.Join(attachmentDir(), filepath.Base(file)))
+	}
+	s.hub.emit(messageEvent{Type: "message_updated", Message: m}, m.SenderID, m.RecipientID)
+	c.JSON(http.StatusOK, m)
 }
 
 func (s *Server) markRead(c *gin.Context) {

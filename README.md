@@ -53,7 +53,9 @@ Text chat API (session cookie required; `POST` requests must come from `FRONTEND
 | `POST` | `/api/conversations/:contactId/read` | Mark the contact's messages as read |
 | `POST` | `/api/conversations/:contactId/attachments` | Send multipart `file` (image or document) with optional `caption` |
 | `GET` | `/api/messages/:id/attachment` | Attachment of a message you sent or received (`?download=1` to download) |
-| `GET` | `/api/ws` | WebSocket with `message`, `read` and `presence` events |
+| `PATCH` | `/api/messages/:id` | Edit your message `{ "body": "..." }` |
+| `DELETE` | `/api/messages/:id` | Delete your message for everyone |
+| `GET` | `/api/ws` | WebSocket with `message`, `message_updated`, `read` and `presence` events |
 
 ## Verify
 
