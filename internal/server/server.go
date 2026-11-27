@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -9,13 +11,15 @@ import (
 
 	_ "github.com/joho/godotenv/autoload"
 
+	"github.com/Darrkkens/go-live/internal/accounts"
 	"github.com/Darrkkens/go-live/internal/database"
 )
 
 type Server struct {
 	port int
 
-	db database.Service
+	db       database.Service
+	accounts accounts.Store
 }
 
 func NewServer() *http.Server {
@@ -24,6 +28,12 @@ func NewServer() *http.Server {
 		port: port,
 
 		db: database.New(),
+	}
+	NewServer.accounts = accounts.Store{DB: NewServer.db.DB()}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := NewServer.accounts.Migrate(ctx); err != nil {
+		log.Fatalf("database migration failed: %v", err)
 	}
 
 	// Declare Server config

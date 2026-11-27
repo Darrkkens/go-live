@@ -15,6 +15,7 @@ import (
 
 // Service represents a service that interacts with a database.
 type Service interface {
+	DB() *sql.DB
 	// Health returns a map of health status information.
 	// The keys and values in the map are service-specific.
 	Health() map[string]string
@@ -23,6 +24,8 @@ type Service interface {
 	// It returns an error if the connection cannot be closed.
 	Close() error
 }
+
+func (s *service) DB() *sql.DB { return s.db }
 
 type service struct {
 	db *sql.DB
