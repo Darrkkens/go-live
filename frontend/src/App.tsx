@@ -15,16 +15,21 @@ type Toast = { kind: 'success' | 'error'; message: string }
 type Contact = Pick<User, 'id' | 'avatar' | 'username' | 'userTag' | 'status'>
 type Panel = 'chat' | 'profile' | 'admin'
 type Attachment = { kind: 'image' | 'file'; url: string; contentType: string; name: string; size: number; width?: number; height?: number }
-type Message = { id: number; senderId: string; recipientId: string; body: string; attachment: Attachment | null; createdAt: string; readAt: string | null }
+type Message = { id: number; senderId: string; recipientId: string; body: string; attachment: Attachment | null; createdAt: string; readAt: string | null; editedAt: string | null; deletedAt: string | null }
 type PendingAttachment = { contactId: string; file: File; kind: 'image' | 'file'; preview: string | null }
 type Conversation = { contactId: string; lastMessage: Message; unread: number }
 type Thread = { messages: Message[]; hasMore: boolean; loaded: boolean }
-type RealtimeEvent = { type: 'message'; message: Message } | { type: 'read'; readerId: string; readAt: string } | { type: 'presence'; userId: string; status: User['status'] }
+type RealtimeEvent = { type: 'message' | 'message_updated'; message: Message } | { type: 'read'; readerId: string; readAt: string } | { type: 'presence'; userId: string; status: User['status'] }
 
 const apiBase = `http://localhost:${import.meta.env.VITE_PORT || '8081'}`
 const realtimeUrl = `${apiBase.replace(/^http/, 'ws')}/api/ws`
 const pageSize = 50
 const maxMessageLength = 4000
+const changeWindowMs = 5 * 60 * 1000
+
+function changeTimeLeft(m: Message, now = Date.now()) {
+  return changeWindowMs - (now - new Date(m.createdAt).getTime())
+}
 const maxImageBytes = 10 * 1024 * 1024
 const maxFileBytes = 25 * 1024 * 1024
 const imageTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
@@ -62,6 +67,18 @@ function FileIcon() {
   )
 }
 
+function MenuIcon({ path }: { path: string }) {
+  return <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d={path} /></svg>
+}
+const iconPaths = {
+  chevron: 'm6 9 6 6 6-6',
+  edit: 'M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4ZM13.5 6.5l4 4',
+  copy: 'M9 9h10v12H9zM5 15H4V3h11v1',
+  trash: 'M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3',
+  ban: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18ZM5.6 5.6l12.8 12.8',
+  close: 'M6 6l12 12M18 6 6 18',
+}
+
 function DownloadIcon() {
   return (
     <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 4v11" /><path d="m7 10 5 5 5-5" /><path d="M5 20h14" /></svg>
@@ -78,6 +95,7 @@ function fileFromClipboard(data: DataTransfer | null) {
 }
 
 function previewText(m: Message) {
+  if (m.deletedAt) return 'Mensagem apagada'
   if (!m.attachment || m.body) return m.body
   return m.attachment.kind === 'image' ? 'Foto' : m.attachment.name
 }
@@ -193,6 +211,13 @@ function App() {
   const [uploadProgress, setUploadProgress] = useState<number | null>(null)
   const [dropActive, setDropActive] = useState(false)
   const [lightbox, setLightbox] = useState<Message | null>(null)
+  const [editing, setEditing] = useState<{ contactId: string; message: Message } | null>(null)
+  const [editDraft, setEditDraft] = useState('')
+  const [menu, setMenu] = useState<{ id: number; up: boolean } | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState<Message | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const [now, setNow] = useState(() => Date.now())
+  const deleteCancelRef = useRef<HTMLButtonElement>(null)
   const dragDepth = useRef(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const lightboxCloseRef = useRef<HTMLButtonElement>(null)
@@ -254,6 +279,30 @@ function App() {
     } catch (err) { notify('error', (err as Error).message) }
   }, [])
 
+  const applyUpdate = useCallback((message: Message) => {
+    const me = userIdRef.current
+    if (!me) return
+    const contactId = message.senderId === me ? message.recipientId : message.senderId
+    setThreads((all) => {
+      const thread = all[contactId]
+      if (!thread) return all
+      return { ...all, [contactId]: { ...thread, messages: thread.messages.map((m) => m.id === message.id ? message : m) } }
+    })
+    setConversations((all) => {
+      const current = all[contactId]
+      if (!current) return all
+      const lastMessage = current.lastMessage.id === message.id ? message : current.lastMessage
+      // The server announces a deletion once, so an unread deleted message is discounted once.
+      const removedUnread = message.deletedAt && message.senderId === contactId && !message.readAt && current.unread > 0
+      return { ...all, [contactId]: { ...current, lastMessage, unread: current.unread - (removedUnread ? 1 : 0) } }
+    })
+    if (message.deletedAt) {
+      setLightbox((current) => current?.id === message.id ? null : current)
+      setEditing((current) => current?.message.id === message.id ? null : current)
+      setConfirmDelete((current) => current?.id === message.id ? null : current)
+    }
+  }, [])
+
   const receive = useCallback((message: Message) => {
     const me = userIdRef.current
     if (!me) return
@@ -289,6 +338,7 @@ function App() {
         let data: RealtimeEvent
         try { data = JSON.parse(event.data) } catch { return }
         if (data.type === 'message') receive(data.message)
+        if (data.type === 'message_updated') applyUpdate(data.message)
         if (data.type === 'presence') {
           const { userId, status } = data
           setContacts((list) => list.map((contact) => contact.id === userId ? { ...contact, status } : contact))
@@ -308,7 +358,7 @@ function App() {
     }
     connect()
     return () => { stopped = true; window.clearTimeout(timer); socket?.close() }
-  }, [user?.id, loadConversations, loadThread, receive])
+  }, [user?.id, loadConversations, loadThread, receive, applyUpdate])
 
   useEffect(() => {
     const onVisibility = () => setVisible(document.visibilityState === 'visible')
@@ -425,9 +475,93 @@ function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [lightbox])
 
+  function startEdit(message: Message) {
+    if (!selectedContactId) return
+    setMenu(null)
+    setEditing({ contactId: selectedContactId, message })
+    setEditDraft(message.body)
+    window.requestAnimationFrame(() => { const field = composerRef.current; if (field) { field.focus(); field.setSelectionRange(field.value.length, field.value.length) } })
+  }
+
+  function cancelEdit() {
+    setEditing(null); setEditDraft('')
+    composerRef.current?.focus()
+  }
+
+  async function saveEdit() {
+    if (!editing || sending) return
+    const body = editDraft.trim()
+    if (!body && !editing.message.attachment) { notify('error', 'A mensagem não pode ficar vazia. Para remover, use Apagar.'); return }
+    if (body.length > maxMessageLength) { notify('error', `A mensagem pode ter até ${maxMessageLength} caracteres.`); return }
+    if (body === editing.message.body) { cancelEdit(); return }
+    setSending(true)
+    try {
+      const updated = await request<Message>(`/api/messages/${editing.message.id}`, { method: 'PATCH', body: JSON.stringify({ body }) })
+      applyUpdate(updated)
+      setEditing(null); setEditDraft('')
+    } catch (err) {
+      notify('error', (err as Error).message)
+      if (changeTimeLeft(editing.message) <= 0) { setEditing(null); setEditDraft('') }
+    }
+    finally { setSending(false); composerRef.current?.focus() }
+  }
+
+  async function deleteMessage() {
+    if (!confirmDelete) return
+    setDeleting(true)
+    try {
+      const updated = await request<Message>(`/api/messages/${confirmDelete.id}`, { method: 'DELETE' })
+      applyUpdate(updated)
+      setConfirmDelete(null)
+    } catch (err) { notify('error', (err as Error).message) }
+    finally { setDeleting(false) }
+  }
+
+  async function copyMessage(message: Message) {
+    setMenu(null)
+    try { await navigator.clipboard.writeText(message.body); notify('success', 'Texto copiado.') }
+    catch { notify('error', 'Não foi possível copiar o texto.') }
+  }
+
+  function openMenu(message: Message, anchor: HTMLElement) {
+    setNow(Date.now())
+    const canvas = canvasRef.current?.getBoundingClientRect()
+    const rect = anchor.getBoundingClientRect()
+    setMenu((current) => current?.id === message.id ? null : { id: message.id, up: !!canvas && rect.bottom > canvas.top + canvas.height * 0.6 })
+  }
+
+  useEffect(() => {
+    if (!menu && !editing) return
+    const timer = window.setInterval(() => setNow(Date.now()), 15000)
+    return () => window.clearInterval(timer)
+  }, [menu, editing])
+
+  useEffect(() => {
+    if (!menu) return
+    const close = (event: MouseEvent) => { if (!(event.target as Element).closest?.('.message-menu, .bubble-menu-button')) setMenu(null) }
+    const onKey = (event: globalThis.KeyboardEvent) => { if (event.key === 'Escape') setMenu(null) }
+    document.addEventListener('mousedown', close)
+    window.addEventListener('keydown', onKey)
+    return () => { document.removeEventListener('mousedown', close); window.removeEventListener('keydown', onKey) }
+  }, [menu])
+
+  useEffect(() => {
+    if (!confirmDelete) return
+    deleteCancelRef.current?.focus()
+    const onKey = (event: globalThis.KeyboardEvent) => { if (event.key === 'Escape' && !deleting) setConfirmDelete(null) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [confirmDelete, deleting])
+
+  useEffect(() => {
+    setMenu(null)
+    setEditing((current) => current && current.contactId !== selectedContactId ? null : current)
+  }, [selectedContactId, panel])
+
   async function sendMessage(event?: FormEvent) {
     event?.preventDefault()
     if (!selectedContactId || sending) return
+    if (editing?.contactId === selectedContactId) { await saveEdit(); return }
     const contactId = selectedContactId
     if (pending?.contactId === contactId) { await sendPending(contactId, pending); return }
     const body = (drafts[contactId] ?? '').trim()
@@ -447,14 +581,19 @@ function App() {
     if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault()
       void sendMessage()
+    } else if (event.key === 'Escape' && editing && !sending) {
+      cancelEdit()
     } else if (event.key === 'Escape' && pending && !sending) {
       discardPending()
+    } else if (event.key === 'ArrowUp' && !editing && !pending && !event.currentTarget.value && selectedContactId && user) {
+      const last = [...(threads[selectedContactId]?.messages ?? [])].reverse().find((m) => m.senderId === user.id && !m.deletedAt)
+      if (last && changeTimeLeft(last) > 0) { event.preventDefault(); startEdit(last) }
     }
   }
 
   function clearSession() {
     setUser(null); setUsers([]); setContacts([]); setSelectedContactId(null); setPanel('chat')
-    setConversations({}); setThreads({}); setDrafts({}); discardPending(); setLightbox(null)
+    setConversations({}); setThreads({}); setDrafts({}); discardPending(); setLightbox(null); setEditing(null); setMenu(null); setConfirmDelete(null)
   }
 
   useLayoutEffect(() => {
@@ -567,6 +706,8 @@ function App() {
     .filter((contact) => `${contact.username} ${contact.userTag}`.toLocaleLowerCase().includes(search.toLocaleLowerCase()))
     .sort((a, b) => (conversations[b.id]?.lastMessage.id ?? 0) - (conversations[a.id]?.lastMessage.id ?? 0))
   const draft = selectedContactId ? drafts[selectedContactId] ?? '' : ''
+  const isEditing = !!editing && editing.contactId === selectedContactId
+  const composerValue = isEditing ? editDraft : draft
 
   return (
     <main className={user ? 'chat-app' : 'auth-shell'}>
@@ -599,7 +740,7 @@ function App() {
                   <span className="contact-text">
                     <span className="contact-line"><strong>{contact.username}</strong>{conversations[contact.id] && <time className="contact-time" dateTime={conversations[contact.id].lastMessage.createdAt}>{previewTime(conversations[contact.id].lastMessage.createdAt)}</time>}</span>
                     <span className="contact-line">
-                      <small className="contact-preview">{conversations[contact.id]?.lastMessage.senderId === user.id && <ReadTicks message={conversations[contact.id].lastMessage} />}{conversations[contact.id] ? <>{conversations[contact.id].lastMessage.senderId === user.id && 'Você: '}{conversations[contact.id].lastMessage.attachment && (conversations[contact.id].lastMessage.attachment!.kind === 'image' ? <PhotoIcon /> : <FileIcon />)}{previewText(conversations[contact.id].lastMessage)}</> : `@${contact.userTag}`}</small>
+                      <small className="contact-preview">{conversations[contact.id]?.lastMessage.senderId === user.id && !conversations[contact.id].lastMessage.deletedAt && <ReadTicks message={conversations[contact.id].lastMessage} />}{conversations[contact.id] ? <>{conversations[contact.id].lastMessage.senderId === user.id && 'Você: '}{conversations[contact.id].lastMessage.attachment && (conversations[contact.id].lastMessage.attachment!.kind === 'image' ? <PhotoIcon /> : <FileIcon />)}{previewText(conversations[contact.id].lastMessage)}</> : `@${contact.userTag}`}</small>
                       {conversations[contact.id]?.unread ? <span className="unread-badge" aria-label={`${conversations[contact.id].unread} não lidas`}>{conversations[contact.id].unread > 99 ? '99+' : conversations[contact.id].unread}</span> : <span className={`presence-dot ${contact.status}`} aria-label={contact.status} />}
                     </span>
                   </span>
@@ -644,8 +785,25 @@ function App() {
                             return (
                               <li key={m.id} className="message-row-wrap">
                                 {newDay && <div className="day-separator"><span>{dayLabel(m.createdAt)}</span></div>}
-                                <div className={`message-row ${mine ? 'mine' : 'theirs'} ${previous && previous.senderId === m.senderId && !newDay ? 'grouped' : ''}`}>
-                                  <div className={`bubble ${m.attachment?.kind === 'image' ? 'has-image' : ''} ${m.attachment?.kind === 'image' && !m.body ? 'image-only' : ''} ${m.attachment?.kind === 'file' ? 'has-file' : ''}`}>
+                                <div className={`message-row ${mine ? 'mine' : 'theirs'} ${previous && previous.senderId === m.senderId && !newDay ? 'grouped' : ''} ${menu?.id === m.id ? 'menu-open' : ''} ${editing?.message.id === m.id ? 'being-edited' : ''}`}>
+                                  {m.deletedAt ? (
+                                    <div className="bubble deleted">
+                                      <p><MenuIcon path={iconPaths.ban} />{mine ? 'Você apagou esta mensagem' : 'Mensagem apagada'}</p>
+                                      <span className="bubble-meta"><time dateTime={m.createdAt}>{timeFormat.format(new Date(m.createdAt))}</time></span>
+                                    </div>
+                                  ) : (
+                                  <div className={`bubble ${m.attachment?.kind === 'image' ? 'has-image' : ''} ${m.attachment?.kind === 'image' && !m.body ? 'image-only' : ''} ${m.attachment?.kind === 'file' ? 'has-file' : ''}`}
+                                    onContextMenu={(e) => { if ((e.target as Element).closest('a, .bubble-image')) return; e.preventDefault(); openMenu(m, e.currentTarget) }}>
+                                    <button type="button" className="bubble-menu-button" aria-label="Opções da mensagem" aria-haspopup="menu" aria-expanded={menu?.id === m.id} onClick={(e) => openMenu(m, e.currentTarget)}><MenuIcon path={iconPaths.chevron} /></button>
+                                    {menu?.id === m.id && (
+                                      <div className={`message-menu ${menu.up ? 'up' : ''}`} role="menu">
+                                        {mine && changeTimeLeft(m, now) > 0 && <button type="button" role="menuitem" onClick={() => startEdit(m)}><MenuIcon path={iconPaths.edit} />{m.attachment ? (m.body ? 'Editar legenda' : 'Adicionar legenda') : 'Editar'}</button>}
+                                        {m.body && <button type="button" role="menuitem" onClick={() => copyMessage(m)}><MenuIcon path={iconPaths.copy} />Copiar texto</button>}
+                                        {mine && changeTimeLeft(m, now) > 0 && <button type="button" role="menuitem" className="danger" onClick={() => { setMenu(null); setConfirmDelete(m) }}><MenuIcon path={iconPaths.trash} />Apagar</button>}
+                                        {mine && <span className="message-menu-note">{changeTimeLeft(m, now) > 0 ? `Editar e apagar: mais ${Math.max(1, Math.ceil(changeTimeLeft(m, now) / 60000))} min` : 'Editar e apagar só nos primeiros 5 minutos'}</span>}
+                                        {!mine && !m.body && <span className="message-menu-empty">Sem ações disponíveis</span>}
+                                      </div>
+                                    )}
                                     {m.attachment?.kind === 'file' && (
                                       <div className="file-card">
                                         <a className="file-card-main" href={`${apiBase}${m.attachment.url}${m.attachment.contentType === 'application/pdf' ? '' : '?download=1'}`} target="_blank" rel="noopener" title={m.attachment.contentType === 'application/pdf' ? 'Abrir PDF em nova aba' : 'Baixar arquivo'}>
@@ -661,8 +819,9 @@ function App() {
                                       </button>
                                     )}
                                     {m.body && <p>{m.body}</p>}
-                                    <span className="bubble-meta"><time dateTime={m.createdAt}>{timeFormat.format(new Date(m.createdAt))}</time>{mine && <ReadTicks message={m} />}</span>
+                                    <span className="bubble-meta">{m.editedAt && <span className="edited-mark" title={`Editada às ${timeFormat.format(new Date(m.editedAt))}`}>editada</span>}<time dateTime={m.createdAt}>{timeFormat.format(new Date(m.createdAt))}</time>{mine && <ReadTicks message={m} />}</span>
                                   </div>
+                                  )}
                                 </div>
                               </li>
                             )
@@ -671,7 +830,14 @@ function App() {
                       )}
                     </div>
                     <div className="composer-area">
-                      {pending?.contactId === selectedContact.id && (
+                      {isEditing && editing && (
+                        <div className="edit-banner" aria-live="polite">
+                          <MenuIcon path={iconPaths.edit} />
+                          <span><strong>{editing.message.attachment ? 'Editando legenda' : 'Editando mensagem'}{changeTimeLeft(editing.message, now) > 0 && changeTimeLeft(editing.message, now) < 60000 && <em className="edit-deadline"> · menos de 1 min</em>}</strong><small>{editing.message.body || (editing.message.attachment?.kind === 'image' ? 'Foto sem legenda' : editing.message.attachment?.name)}</small></span>
+                          <button type="button" onClick={cancelEdit} disabled={sending} aria-label="Cancelar edição" title="Cancelar (Esc)"><MenuIcon path={iconPaths.close} /></button>
+                        </div>
+                      )}
+                      {!isEditing && pending?.contactId === selectedContact.id && (
                         <div className="image-preview" aria-label={pending.kind === 'image' ? 'Imagem pronta para enviar' : 'Arquivo pronto para enviar'}>
                           <div className={`image-preview-thumb ${pending.kind === 'file' ? 'is-file' : ''}`}>
                             {pending.preview ? <img src={pending.preview} alt="Prévia da imagem" /> : <FileBadge name={pending.file.name} />}
@@ -685,13 +851,13 @@ function App() {
                         </div>
                       )}
                       <form className="composer" onSubmit={sendMessage}>
-                        <button type="button" className="attach-button" onClick={() => fileInputRef.current?.click()} disabled={sending} aria-label="Anexar arquivo do computador" title="Anexar imagem ou arquivo (ou cole com Ctrl+V / arraste)">
+                        <button type="button" className="attach-button" onClick={() => fileInputRef.current?.click()} disabled={sending || isEditing} aria-label="Anexar arquivo do computador" title="Anexar imagem ou arquivo (ou cole com Ctrl+V / arraste)">
                           <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5 12.4 20a5.5 5.5 0 0 1-7.8-7.8l8.9-8.9a3.7 3.7 0 0 1 5.2 5.2l-8.9 8.9a1.8 1.8 0 0 1-2.6-2.6l8.2-8.2" /></svg>
                         </button>
                         <input ref={fileInputRef} type="file" hidden accept={attachmentAccept} onChange={(e) => { attachFile(e.target.files?.[0]); e.target.value = '' }} />
                         <label className="sr-only" htmlFor="composer-input">Mensagem para {selectedContact.username}</label>
-                        <textarea id="composer-input" ref={composerRef} rows={1} maxLength={maxMessageLength} placeholder={pending?.contactId === selectedContact.id ? 'Adicionar legenda' : 'Mensagem'} value={draft} onKeyDown={composerKeyDown} onChange={(e) => setDrafts((all) => ({ ...all, [selectedContact.id]: e.target.value }))} />
-                        <button type="submit" disabled={sending || (!draft.trim() && pending?.contactId !== selectedContact.id)} aria-label="Enviar mensagem" title="Enviar (Enter)"><img src="/figma-chat/send.svg" alt="" /></button>
+                        <textarea id="composer-input" ref={composerRef} rows={1} maxLength={maxMessageLength} placeholder={isEditing ? (editing?.message.attachment ? 'Legenda' : 'Mensagem') : pending?.contactId === selectedContact.id ? 'Adicionar legenda' : 'Mensagem'} value={composerValue} onKeyDown={composerKeyDown} onChange={(e) => isEditing ? setEditDraft(e.target.value) : setDrafts((all) => ({ ...all, [selectedContact.id]: e.target.value }))} />
+                        <button type="submit" disabled={sending || (isEditing ? !editDraft.trim() && !editing?.message.attachment : !draft.trim() && pending?.contactId !== selectedContact.id)} aria-label={isEditing ? 'Salvar edição' : 'Enviar mensagem'} title={isEditing ? 'Salvar (Enter)' : 'Enviar (Enter)'}>{isEditing ? <svg className="save-edit-icon" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5" /></svg> : <img src="/figma-chat/send.svg" alt="" />}</button>
                       </form>
                     </div>
                     {dropActive && <div className="drop-overlay" aria-hidden="true"><div><strong>Solte o arquivo aqui</strong><span>Imagens até 10 MB · PDF, documentos e compactados até 25 MB</span></div></div>}
@@ -797,6 +963,19 @@ function App() {
             )}
           </section>
         </>
+      )}
+      {confirmDelete && (
+        <div className="app-modal-backdrop" onClick={(e) => { if (e.target === e.currentTarget && !deleting) setConfirmDelete(null) }}>
+          <div className="app-modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-title" aria-describedby="delete-desc">
+            <h2 id="delete-title">Apagar mensagem?</h2>
+            <p id="delete-desc">Ela será apagada para você e para {contacts.find((c) => c.id === confirmDelete.recipientId)?.username ?? 'o contato'}.{confirmDelete.attachment ? ' O anexo também será removido.' : ''} Isso não pode ser desfeito.</p>
+            {(confirmDelete.body || confirmDelete.attachment) && <blockquote>{confirmDelete.body || confirmDelete.attachment?.name}</blockquote>}
+            <div className="form-actions">
+              <button ref={deleteCancelRef} type="button" className="ghost-button" onClick={() => setConfirmDelete(null)} disabled={deleting}>Cancelar</button>
+              <button type="button" className="danger-button" onClick={deleteMessage} disabled={deleting}>{deleting ? 'Apagando…' : 'Apagar para todos'}</button>
+            </div>
+          </div>
+        </div>
       )}
       {lightbox?.attachment?.kind === 'image' && (
         <div className="lightbox" role="dialog" aria-modal="true" aria-label="Imagem em tela cheia" onClick={(e) => { if (e.target === e.currentTarget) setLightbox(null) }}>

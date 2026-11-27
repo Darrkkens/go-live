@@ -141,13 +141,87 @@ func TestMessageFlow(t *testing.T) {
 		t.Fatalf("migration not idempotent: %v", err)
 	}
 
+	edited, err := store.Edit(ctx, ana.ID, all[0].ID, "  msg 1 corrigida ")
+	if err != nil || edited.Body != "msg 1 corrigida" || edited.EditedAt == nil {
+		t.Fatalf("edit: %+v %v", edited, err)
+	}
+	if _, err := store.Edit(ctx, bia.ID, all[0].ID, "hack"); err != ErrNotFound {
+		t.Fatalf("recipient edited: %v", err)
+	}
+	if _, err := store.Edit(ctx, ana.ID, all[0].ID, "   "); err != ErrInvalid {
+		t.Fatalf("empty edit of text message: %v", err)
+	}
+	if cleared, err := store.Edit(ctx, ana.ID, photo.ID, "agora com legenda"); err != nil || cleared.Body != "agora com legenda" {
+		t.Fatalf("caption edit: %v", err)
+	}
+	if cleared, err := store.Edit(ctx, ana.ID, photo.ID, ""); err != nil || cleared.Body != "" || cleared.Attachment == nil {
+		t.Fatalf("caption removal: %v", err)
+	}
+	if _, _, err := store.Delete(ctx, bia.ID, photo.ID); err != ErrNotFound {
+		t.Fatalf("recipient deleted: %v", err)
+	}
+	deleted, file, err := store.Delete(ctx, ana.ID, photo.ID)
+	if err != nil || file != "x.png" || deleted.DeletedAt == nil || deleted.Attachment != nil || deleted.Body != "" {
+		t.Fatalf("delete: %+v %q %v", deleted, file, err)
+	}
+	if _, _, err := store.Delete(ctx, ana.ID, photo.ID); err != ErrNotFound {
+		t.Fatalf("double delete: %v", err)
+	}
+	if _, err := store.Edit(ctx, ana.ID, photo.ID, "volta"); err != ErrNotFound {
+		t.Fatalf("edited deleted message: %v", err)
+	}
+	if _, err := store.Attachment(ctx, bia.ID, photo.ID); err != sql.ErrNoRows {
+		t.Fatalf("deleted attachment still served: %v", err)
+	}
+	old, _ := store.Send(ctx, ana.ID, bia.ID, "mensagem antiga")
+	if _, err := db.ExecContext(ctx, `UPDATE direct_messages SET created_at=NOW()-interval '5 minutes 1 second' WHERE id=$1`, old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Edit(ctx, ana.ID, old.ID, "tarde demais"); err != ErrExpired {
+		t.Fatalf("edit after window: %v", err)
+	}
+	if _, _, err := store.Delete(ctx, ana.ID, old.ID); err != ErrExpired {
+		t.Fatalf("delete after window: %v", err)
+	}
+	if _, err := store.Edit(ctx, bia.ID, old.ID, "x"); err != ErrNotFound {
+		t.Fatalf("recipient on expired message: %v", err)
+	}
+	recent, _ := store.Send(ctx, ana.ID, bia.ID, "quase no limite")
+	db.ExecContext(ctx, `UPDATE direct_messages SET created_at=NOW()-interval '4 minutes 50 seconds' WHERE id=$1`, recent.ID)
+	if _, err := store.Edit(ctx, ana.ID, recent.ID, "ainda dá"); err != nil {
+		t.Fatalf("edit inside window: %v", err)
+	}
+
+	unreadBefore := 0
+	for _, c := range mustConversations(t, store, ctx, bia.ID) {
+		if c.ContactID == ana.ID {
+			unreadBefore = c.Unread
+		}
+	}
+	toDelete, _ := store.Send(ctx, ana.ID, bia.ID, "vou apagar")
+	store.Delete(ctx, ana.ID, toDelete.ID)
+	for _, c := range mustConversations(t, store, ctx, bia.ID) {
+		if c.ContactID == ana.ID && (c.Unread != unreadBefore || c.LastMessage.DeletedAt == nil) {
+			t.Fatalf("deleted unread message still counted: %+v (before %d)", c, unreadBefore)
+		}
+	}
+
 	if err := users.SetAccountStatus(ctx, caio.ID, "blocked"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Send(ctx, ana.ID, caio.ID, "oi"); err != ErrRecipient {
 		t.Fatalf("blocked recipient: %v", err)
 	}
-	if convs, _ := store.Conversations(ctx, ana.ID); len(convs) != 1 || convs[0].ContactID != bia.ID || convs[0].Unread != 1 {
+	if convs, _ := store.Conversations(ctx, ana.ID); len(convs) != 1 || convs[0].ContactID != bia.ID || convs[0].Unread != 1 || convs[0].LastMessage.DeletedAt == nil {
 		t.Fatalf("conversations after block: %+v", convs)
 	}
+}
+
+func mustConversations(t *testing.T, store Store, ctx context.Context, userID string) []Conversation {
+	t.Helper()
+	list, err := store.Conversations(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return list
 }

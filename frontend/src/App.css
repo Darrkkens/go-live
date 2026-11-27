@@ -253,5 +253,45 @@ a:focus-visible { outline: 3px solid #1a9cff; outline-offset: 2px; }
 .own-presence { position: absolute; right: -1px; bottom: -1px; width: 12px; height: 12px; border: 2px solid #fff; border-radius: 50%; background: #b4bdca; }
 @media (max-width: 480px) { .status-options { grid-template-columns: 1fr; } .status-option { min-height: 56px; } .profile-hero { padding: 24px 16px 18px; } }
 @media (prefers-reduced-motion: reduce) { .profile-avatar, .profile-avatar-overlay, .status-option { transition: none; } .spinner { animation-duration: 2s; } }
+
+/* Message actions */
+.bubble-menu-button { position: absolute; z-index: 2; top: 4px; right: 4px; display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 50%; background: inherit; color: #707991; opacity: 0; cursor: pointer; box-shadow: -6px 0 8px -2px rgba(255,255,255,.9); transition: opacity .12s ease; }
+.message-row.mine .bubble-menu-button { box-shadow: -6px 0 8px -2px rgba(239,254,221,.95); }
+.bubble.has-image .bubble-menu-button, .bubble.image-only .bubble-menu-button { top: 8px; right: 8px; background: rgba(1,22,39,.45); color: #fff; box-shadow: none; }
+.bubble:hover .bubble-menu-button, .bubble:focus-within .bubble-menu-button, .message-row.menu-open .bubble-menu-button { opacity: 1; }
+@media (hover: none) { .bubble-menu-button { opacity: .7; } }
+.message-menu { position: absolute; z-index: 10; top: 30px; min-width: 190px; padding: 6px; border-radius: 12px; background: #fff; box-shadow: 0 12px 32px rgba(1,22,39,.22), 0 0 0 1px rgba(1,22,39,.05); transform-origin: top; animation: menu-in .12s ease-out; }
+.message-row.mine .message-menu { right: 4px; }
+.message-row.theirs .message-menu { left: calc(min(520px, 80%) - 190px); }
+.message-menu.up { top: auto; bottom: calc(100% - 30px); transform-origin: bottom; }
+.message-menu button { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 38px; padding: 8px 10px; border: 0; border-radius: 8px; background: transparent; color: #011627; font-size: 14px; text-align: left; cursor: pointer; }
+.message-menu button:hover, .message-menu button:focus-visible { background: #f1f4f8; }
+.message-menu button svg { flex: none; color: #707991; }
+.message-menu button.danger, .message-menu button.danger svg { color: #d93a3a; }
+.message-menu-empty { display: block; padding: 8px 10px; color: #8b95a7; font-size: 13px; }
+@keyframes menu-in { from { opacity: 0; transform: scale(.96); } }
+.message-row.theirs .bubble-menu-button { right: 4px; }
+.bubble.deleted { background: rgba(255,255,255,.75); color: #707991; box-shadow: none; }
+.message-row.mine .bubble.deleted { background: rgba(239,254,221,.75); }
+.bubble.deleted p { display: inline-flex; align-items: center; gap: 6px; font-style: italic; }
+.bubble.deleted p svg { flex: none; width: 16px; height: 16px; }
+.edited-mark { margin-right: 4px; font-style: italic; }
+.message-row.being-edited .bubble { box-shadow: 0 0 0 2px #3776bd; }
+.edit-banner { display: flex; align-items: center; gap: 12px; width: min(694px,100%); margin: 0 auto 8px; padding: 8px 8px 8px 14px; border-left: 4px solid #3776bd; border-radius: 12px; background: #fff; box-shadow: 0 6px 20px rgba(1,22,39,.12); color: #3776bd; }
+.edit-banner > span { display: flex; flex-direction: column; flex: 1; min-width: 0; gap: 2px; }
+.edit-banner strong { font-size: 14px; }
+.edit-banner small { overflow: hidden; color: #707991; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.edit-banner button { display: grid; place-items: center; width: 32px; height: 32px; flex: none; padding: 0; border: 0; border-radius: 50%; background: #f1f3f6; color: #4d5868; cursor: pointer; }
+.save-edit-icon { color: #3776bd; }
+.app-modal-backdrop { position: fixed; z-index: 70; inset: 0; display: grid; place-items: center; padding: 16px; background: rgba(1,10,20,.5); animation: fade-in .12s ease-out; }
+.app-modal { width: min(420px, 100%); padding: 22px; border-radius: 16px; background: #fff; box-shadow: 0 24px 60px rgba(0,0,0,.25); }
+.app-modal h2 { margin: 0 0 8px; font-size: 19px; }
+.app-modal p { margin: 0 0 12px; color: #4d5868; font-size: 14px; line-height: 1.45; }
+.app-modal blockquote { margin: 0 0 16px; padding: 8px 12px; overflow: hidden; border-left: 3px solid #d9dce0; border-radius: 6px; background: #f6f8fa; color: #4d5868; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.danger-button { min-height: 40px; padding: 8px 16px; border: 0; border-radius: 10px; background: #d93a3a; color: #fff; font-weight: 600; cursor: pointer; }
+.danger-button:hover:not(:disabled) { background: #b92c2c; }
+.danger-button:disabled { opacity: .6; cursor: wait; }
+@keyframes fade-in { from { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .message-menu, .app-modal-backdrop { animation: none; } }
 .message-menu-note { display: block; margin-top: 4px; padding: 8px 10px 4px; border-top: 1px solid #edf0f4; color: #8b95a7; font-size: 12px; }
 .edit-deadline { color: #d9822b; font-style: normal; font-weight: 600; }
