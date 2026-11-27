@@ -107,6 +107,36 @@ func TestMessageFlow(t *testing.T) {
 		t.Fatalf("read flags: %+v", after)
 	}
 
+	img := &Attachment{FileName: "x.png", ContentType: "image/png", Name: "foto.png", Size: 100, Width: 10, Height: 20}
+	doc, err := store.SendWithAttachment(ctx, ana.ID, bia.ID, "", &Attachment{FileName: "y.pdf", ContentType: "application/pdf", Name: "Relatório.pdf", Size: 2048})
+	if err != nil || doc.Attachment.Kind != "file" || doc.Attachment.Name != "Relatório.pdf" || doc.Attachment.Size != 2048 || doc.Attachment.Width != 0 {
+		t.Fatalf("document: %+v %v", doc.Attachment, err)
+	}
+	if _, err := store.SendWithAttachment(ctx, ana.ID, bia.ID, "", &Attachment{FileName: "z.png", ContentType: "image/png", Name: "z.png", Size: 1}); err != ErrInvalid {
+		t.Fatalf("image without size accepted: %v", err)
+	}
+	photo, err := store.SendWithAttachment(ctx, ana.ID, bia.ID, "  ", img)
+	if err != nil || photo.Body != "" || photo.Attachment == nil || photo.Attachment.Kind != "image" || photo.Attachment.URL != fmt.Sprintf("/api/messages/%d/attachment", photo.ID) {
+		t.Fatalf("image without caption: %+v %v", photo, err)
+	}
+	if withCaption, err := store.SendWithAttachment(ctx, bia.ID, ana.ID, " legenda ", img); err != nil || withCaption.Body != "legenda" {
+		t.Fatalf("caption: %+v %v", withCaption, err)
+	}
+	if _, err := store.SendWithAttachment(ctx, ana.ID, bia.ID, "", &Attachment{}); err != ErrInvalid {
+		t.Fatalf("empty attachment: %v", err)
+	}
+	if a, err := store.Attachment(ctx, bia.ID, photo.ID); err != nil || a.FileName != "x.png" {
+		t.Fatalf("recipient attachment: %v", err)
+	}
+	if _, err := store.Attachment(ctx, caio.ID, photo.ID); err != sql.ErrNoRows {
+		t.Fatalf("outsider read attachment: %v", err)
+	}
+	if _, err := store.Attachment(ctx, ana.ID, all[0].ID); err != sql.ErrNoRows {
+		t.Fatalf("text message has attachment: %v", err)
+	}
+	if convs, _ := store.Conversations(ctx, bia.ID); convs[0].LastMessage.Attachment == nil {
+		t.Fatalf("conversation preview lost attachment: %+v", convs)
+	}
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("migration not idempotent: %v", err)
 	}
@@ -117,7 +147,7 @@ func TestMessageFlow(t *testing.T) {
 	if _, err := store.Send(ctx, ana.ID, caio.ID, "oi"); err != ErrRecipient {
 		t.Fatalf("blocked recipient: %v", err)
 	}
-	if convs, _ := store.Conversations(ctx, ana.ID); len(convs) != 1 || convs[0].ContactID != bia.ID || convs[0].Unread != 0 {
+	if convs, _ := store.Conversations(ctx, ana.ID); len(convs) != 1 || convs[0].ContactID != bia.ID || convs[0].Unread != 1 {
 		t.Fatalf("conversations after block: %+v", convs)
 	}
 }

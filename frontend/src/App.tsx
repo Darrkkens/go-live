@@ -14,7 +14,9 @@ type User = {
 type Toast = { kind: 'success' | 'error'; message: string }
 type Contact = Pick<User, 'id' | 'avatar' | 'username' | 'userTag' | 'status'>
 type Panel = 'chat' | 'profile' | 'admin'
-type Message = { id: number; senderId: string; recipientId: string; body: string; createdAt: string; readAt: string | null }
+type Attachment = { kind: 'image' | 'file'; url: string; contentType: string; name: string; size: number; width?: number; height?: number }
+type Message = { id: number; senderId: string; recipientId: string; body: string; attachment: Attachment | null; createdAt: string; readAt: string | null }
+type PendingAttachment = { contactId: string; file: File; kind: 'image' | 'file'; preview: string | null }
 type Conversation = { contactId: string; lastMessage: Message; unread: number }
 type Thread = { messages: Message[]; hasMore: boolean; loaded: boolean }
 type RealtimeEvent = { type: 'message'; message: Message } | { type: 'read'; readerId: string; readAt: string } | { type: 'presence'; userId: string; status: User['status'] }
@@ -23,6 +25,92 @@ const apiBase = `http://localhost:${import.meta.env.VITE_PORT || '8081'}`
 const realtimeUrl = `${apiBase.replace(/^http/, 'ws')}/api/ws`
 const pageSize = 50
 const maxMessageLength = 4000
+const maxImageBytes = 10 * 1024 * 1024
+const maxFileBytes = 25 * 1024 * 1024
+const imageTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+const documentExtensions = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp', 'txt', 'csv', 'md', 'zip', 'rar', '7z']
+const attachmentAccept = [...imageTypes, ...documentExtensions.map((ext) => `.${ext}`)].join(',')
+
+function fileExtension(name: string) {
+  const dot = name.lastIndexOf('.')
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : ''
+}
+
+function fileTone(ext: string) {
+  if (ext === 'pdf') return 'pdf'
+  if (['doc', 'docx', 'odt', 'txt', 'md'].includes(ext)) return 'doc'
+  if (['xls', 'xlsx', 'ods', 'csv'].includes(ext)) return 'sheet'
+  if (['ppt', 'pptx', 'odp'].includes(ext)) return 'slides'
+  return 'archive'
+}
+
+function FileBadge({ name, size = 'md' }: { name: string; size?: 'sm' | 'md' }) {
+  const ext = fileExtension(name)
+  return (
+    <span className={`file-badge ${fileTone(ext)} ${size}`} aria-hidden="true">
+      <svg viewBox="0 0 32 40" fill="none"><path d="M4 1h17l10 10v25a3 3 0 0 1-3 3H4a3 3 0 0 1-3-3V4a3 3 0 0 1 3-3Z" fill="currentColor" /><path d="M21 1v7a3 3 0 0 0 3 3h7" fill="rgba(255,255,255,.35)" /></svg>
+      <span>{ext.slice(0, 4) || 'arq'}</span>
+    </span>
+  )
+}
+
+function FileIcon() {
+  return (
+    <svg className="preview-icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z" /><path d="M14 3v5h5" />
+    </svg>
+  )
+}
+
+function DownloadIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 4v11" /><path d="m7 10 5 5 5-5" /><path d="M5 20h14" /></svg>
+  )
+}
+
+function formatBytes(bytes: number) {
+  return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1).replace('.', ',')} MB`
+}
+
+function fileFromClipboard(data: DataTransfer | null) {
+  if (!data) return undefined
+  return data.files[0] ?? [...data.items].find((i) => i.kind === 'file')?.getAsFile() ?? undefined
+}
+
+function previewText(m: Message) {
+  if (!m.attachment || m.body) return m.body
+  return m.attachment.kind === 'image' ? 'Foto' : m.attachment.name
+}
+
+function PhotoIcon() {
+  return (
+    <svg className="preview-icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="3" /><circle cx="9" cy="10" r="2" /><path d="m21 16-5-5-9 9" />
+    </svg>
+  )
+}
+
+function bubbleImageSize(a: Attachment) {
+  const width = a.width || 320, height = a.height || 240
+  const scale = Math.min(1, 320 / width, 360 / height)
+  return { width: Math.max(80, Math.round(width * scale)), height: Math.max(60, Math.round(height * scale)) }
+}
+
+function uploadAttachment(contactId: string, file: File, caption: string, onProgress: (fraction: number) => void) {
+  return new Promise<Message>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${apiBase}/api/conversations/${contactId}/attachments`)
+    xhr.withCredentials = true
+    xhr.responseType = 'json'
+    xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress(event.loaded / event.total) }
+    xhr.onload = () => xhr.status >= 200 && xhr.status < 300 ? resolve(xhr.response as Message) : reject(new Error(xhr.response?.error || `Erro HTTP ${xhr.status}`))
+    xhr.onerror = () => reject(new Error('Falha de conexão ao enviar o arquivo.'))
+    const data = new FormData()
+    data.append('file', file)
+    data.append('caption', caption)
+    xhr.send(data)
+  })
+}
 const avatarSource = (path: string) => path.startsWith('/api/avatars/') ? `${apiBase}${path}` : path
 
 function mergeMessages(current: Message[], incoming: Message[]) {
@@ -101,6 +189,13 @@ function App() {
   const [threads, setThreads] = useState<Record<string, Thread>>({})
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [sending, setSending] = useState(false)
+  const [pending, setPending] = useState<PendingAttachment | null>(null)
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null)
+  const [dropActive, setDropActive] = useState(false)
+  const [lightbox, setLightbox] = useState<Message | null>(null)
+  const dragDepth = useRef(0)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const lightboxCloseRef = useRef<HTMLButtonElement>(null)
   const [loadingOlder, setLoadingOlder] = useState(false)
   const [connected, setConnected] = useState(true)
   const [visible, setVisible] = useState(() => document.visibilityState === 'visible')
@@ -263,10 +358,78 @@ function App() {
     finally { setLoadingOlder(false) }
   }
 
+  function attachFile(file?: File | null) {
+    if (!file || !selectedContactId) return
+    const isImage = imageTypes.includes(file.type)
+    if (!isImage && !documentExtensions.includes(fileExtension(file.name))) {
+      notify('error', 'Tipo de arquivo não permitido. Envie imagens, PDF, documentos do Office/LibreOffice, TXT, CSV, MD, ZIP, RAR ou 7z.'); return
+    }
+    if (isImage && file.size > maxImageBytes) { notify('error', 'A imagem deve ter até 10 MB.'); return }
+    if (file.size > maxFileBytes) { notify('error', 'O arquivo deve ter até 25 MB.'); return }
+    if (file.size === 0) { notify('error', 'O arquivo está vazio.'); return }
+    setPending((current) => {
+      if (current?.preview) URL.revokeObjectURL(current.preview)
+      return { contactId: selectedContactId, file, kind: isImage ? 'image' : 'file', preview: isImage ? URL.createObjectURL(file) : null }
+    })
+    composerRef.current?.focus()
+  }
+
+  function discardPending() {
+    setPending((current) => { if (current?.preview) URL.revokeObjectURL(current.preview); return null })
+  }
+
+  async function sendPending(contactId: string, item: PendingAttachment) {
+    const caption = (drafts[contactId] ?? '').trim()
+    if (caption.length > maxMessageLength) { notify('error', `A legenda pode ter até ${maxMessageLength} caracteres.`); return }
+    setSending(true); setUploadProgress(0)
+    try {
+      const message = await uploadAttachment(contactId, item.file, caption, setUploadProgress)
+      stickToBottom.current = true
+      setDrafts((all) => ({ ...all, [contactId]: '' }))
+      setPending((current) => { if (current === item) { if (item.preview) URL.revokeObjectURL(item.preview); return null } return current })
+      receive(message)
+    } catch (err) { notify('error', (err as Error).message) }
+    finally { setSending(false); setUploadProgress(null); composerRef.current?.focus() }
+  }
+
+  useEffect(() => {
+    if (!selectedContactId || panel !== 'chat') return
+    const onPaste = (event: ClipboardEvent) => {
+      const file = fileFromClipboard(event.clipboardData)
+      if (!file) return
+      event.preventDefault()
+      attachFile(file)
+    }
+    window.addEventListener('paste', onPaste)
+    return () => window.removeEventListener('paste', onPaste)
+  })
+
+  function dragHasFiles(event: DragEvent<HTMLElement>) {
+    return [...event.dataTransfer.types].includes('Files')
+  }
+
+  function dropFile(event: DragEvent<HTMLElement>) {
+    if (!dragHasFiles(event)) return
+    event.preventDefault()
+    dragDepth.current = 0; setDropActive(false)
+    if (!selectedContactId || panel !== 'chat') return
+    if (event.dataTransfer.files.length > 1) notify('error', 'Envie um arquivo por vez; o primeiro foi selecionado.')
+    attachFile(event.dataTransfer.files[0])
+  }
+
+  useEffect(() => {
+    if (!lightbox) return
+    lightboxCloseRef.current?.focus()
+    const onKey = (event: globalThis.KeyboardEvent) => { if (event.key === 'Escape') setLightbox(null) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [lightbox])
+
   async function sendMessage(event?: FormEvent) {
     event?.preventDefault()
     if (!selectedContactId || sending) return
     const contactId = selectedContactId
+    if (pending?.contactId === contactId) { await sendPending(contactId, pending); return }
     const body = (drafts[contactId] ?? '').trim()
     if (!body) return
     if (body.length > maxMessageLength) { notify('error', `A mensagem pode ter até ${maxMessageLength} caracteres.`); return }
@@ -284,12 +447,14 @@ function App() {
     if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault()
       void sendMessage()
+    } else if (event.key === 'Escape' && pending && !sending) {
+      discardPending()
     }
   }
 
   function clearSession() {
     setUser(null); setUsers([]); setContacts([]); setSelectedContactId(null); setPanel('chat')
-    setConversations({}); setThreads({}); setDrafts({})
+    setConversations({}); setThreads({}); setDrafts({}); discardPending(); setLightbox(null)
   }
 
   useLayoutEffect(() => {
@@ -434,7 +599,7 @@ function App() {
                   <span className="contact-text">
                     <span className="contact-line"><strong>{contact.username}</strong>{conversations[contact.id] && <time className="contact-time" dateTime={conversations[contact.id].lastMessage.createdAt}>{previewTime(conversations[contact.id].lastMessage.createdAt)}</time>}</span>
                     <span className="contact-line">
-                      <small className="contact-preview">{conversations[contact.id]?.lastMessage.senderId === user.id && <ReadTicks message={conversations[contact.id].lastMessage} />}{conversations[contact.id] ? <>{conversations[contact.id].lastMessage.senderId === user.id && 'Você: '}{conversations[contact.id].lastMessage.body}</> : `@${contact.userTag}`}</small>
+                      <small className="contact-preview">{conversations[contact.id]?.lastMessage.senderId === user.id && <ReadTicks message={conversations[contact.id].lastMessage} />}{conversations[contact.id] ? <>{conversations[contact.id].lastMessage.senderId === user.id && 'Você: '}{conversations[contact.id].lastMessage.attachment && (conversations[contact.id].lastMessage.attachment!.kind === 'image' ? <PhotoIcon /> : <FileIcon />)}{previewText(conversations[contact.id].lastMessage)}</> : `@${contact.userTag}`}</small>
                       {conversations[contact.id]?.unread ? <span className="unread-badge" aria-label={`${conversations[contact.id].unread} não lidas`}>{conversations[contact.id].unread > 99 ? '99+' : conversations[contact.id].unread}</span> : <span className={`presence-dot ${contact.status}`} aria-label={contact.status} />}
                     </span>
                   </span>
@@ -449,7 +614,11 @@ function App() {
               {user.role === 'master' && <button className="admin-shortcut" type="button" onClick={() => setPanel('admin')}>Admin</button>}
             </div>
           </aside>
-          <section className={`chat-main ${selectedContact && panel === 'chat' || panel !== 'chat' ? 'mobile-open' : ''}`}>
+          <section className={`chat-main ${selectedContact && panel === 'chat' || panel !== 'chat' ? 'mobile-open' : ''}`}
+            onDragEnter={(e) => { if (!dragHasFiles(e) || !selectedContact || panel !== 'chat') return; e.preventDefault(); dragDepth.current += 1; setDropActive(true) }}
+            onDragOver={(e) => { if (dragHasFiles(e) && selectedContact && panel === 'chat') { e.preventDefault(); e.dataTransfer.dropEffect = 'copy' } }}
+            onDragLeave={(e) => { if (!dragHasFiles(e)) return; dragDepth.current = Math.max(0, dragDepth.current - 1); if (dragDepth.current === 0) setDropActive(false) }}
+            onDrop={dropFile}>
             {panel === 'chat' ? (
               <>
                 {selectedContact ? (
@@ -476,8 +645,22 @@ function App() {
                               <li key={m.id} className="message-row-wrap">
                                 {newDay && <div className="day-separator"><span>{dayLabel(m.createdAt)}</span></div>}
                                 <div className={`message-row ${mine ? 'mine' : 'theirs'} ${previous && previous.senderId === m.senderId && !newDay ? 'grouped' : ''}`}>
-                                  <div className="bubble">
-                                    <p>{m.body}</p>
+                                  <div className={`bubble ${m.attachment?.kind === 'image' ? 'has-image' : ''} ${m.attachment?.kind === 'image' && !m.body ? 'image-only' : ''} ${m.attachment?.kind === 'file' ? 'has-file' : ''}`}>
+                                    {m.attachment?.kind === 'file' && (
+                                      <div className="file-card">
+                                        <a className="file-card-main" href={`${apiBase}${m.attachment.url}${m.attachment.contentType === 'application/pdf' ? '' : '?download=1'}`} target="_blank" rel="noopener" title={m.attachment.contentType === 'application/pdf' ? 'Abrir PDF em nova aba' : 'Baixar arquivo'}>
+                                          <FileBadge name={m.attachment.name} />
+                                          <span className="file-card-text"><strong>{m.attachment.name}</strong><small>{formatBytes(m.attachment.size)} · {fileExtension(m.attachment.name).toUpperCase() || 'Arquivo'}</small></span>
+                                        </a>
+                                        <a className="file-card-download" href={`${apiBase}${m.attachment.url}?download=1`} aria-label={`Baixar ${m.attachment.name}`} title="Baixar"><DownloadIcon /></a>
+                                      </div>
+                                    )}
+                                    {m.attachment?.kind === 'image' && (
+                                      <button type="button" className="bubble-image" style={bubbleImageSize(m.attachment)} onClick={() => setLightbox(m)} aria-label="Abrir imagem em tela cheia">
+                                        <img src={`${apiBase}${m.attachment.url}`} alt={m.body || 'Imagem enviada'} loading="lazy" width={m.attachment.width} height={m.attachment.height} />
+                                      </button>
+                                    )}
+                                    {m.body && <p>{m.body}</p>}
                                     <span className="bubble-meta"><time dateTime={m.createdAt}>{timeFormat.format(new Date(m.createdAt))}</time>{mine && <ReadTicks message={m} />}</span>
                                   </div>
                                 </div>
@@ -488,12 +671,30 @@ function App() {
                       )}
                     </div>
                     <div className="composer-area">
+                      {pending?.contactId === selectedContact.id && (
+                        <div className="image-preview" aria-label={pending.kind === 'image' ? 'Imagem pronta para enviar' : 'Arquivo pronto para enviar'}>
+                          <div className={`image-preview-thumb ${pending.kind === 'file' ? 'is-file' : ''}`}>
+                            {pending.preview ? <img src={pending.preview} alt="Prévia da imagem" /> : <FileBadge name={pending.file.name} />}
+                            {uploadProgress !== null && <div className="upload-progress" role="progressbar" aria-label="Enviando arquivo" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(uploadProgress * 100)}><span style={{ width: `${Math.round(uploadProgress * 100)}%` }} /></div>}
+                          </div>
+                          <div className="image-preview-info">
+                            <strong>{pending.file.name || 'Imagem colada'}</strong>
+                            <small>{uploadProgress !== null ? `Enviando… ${Math.round(uploadProgress * 100)}%` : `${formatBytes(pending.file.size)} · Enter envia, Esc cancela`}</small>
+                          </div>
+                          <button type="button" className="image-preview-remove" onClick={discardPending} disabled={sending} aria-label="Remover anexo" title="Remover anexo">×</button>
+                        </div>
+                      )}
                       <form className="composer" onSubmit={sendMessage}>
+                        <button type="button" className="attach-button" onClick={() => fileInputRef.current?.click()} disabled={sending} aria-label="Anexar arquivo do computador" title="Anexar imagem ou arquivo (ou cole com Ctrl+V / arraste)">
+                          <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5 12.4 20a5.5 5.5 0 0 1-7.8-7.8l8.9-8.9a3.7 3.7 0 0 1 5.2 5.2l-8.9 8.9a1.8 1.8 0 0 1-2.6-2.6l8.2-8.2" /></svg>
+                        </button>
+                        <input ref={fileInputRef} type="file" hidden accept={attachmentAccept} onChange={(e) => { attachFile(e.target.files?.[0]); e.target.value = '' }} />
                         <label className="sr-only" htmlFor="composer-input">Mensagem para {selectedContact.username}</label>
-                        <textarea id="composer-input" ref={composerRef} rows={1} maxLength={maxMessageLength} placeholder="Mensagem" value={draft} onKeyDown={composerKeyDown} onChange={(e) => setDrafts((all) => ({ ...all, [selectedContact.id]: e.target.value }))} />
-                        <button type="submit" disabled={sending || !draft.trim()} aria-label="Enviar mensagem" title="Enviar (Enter)"><img src="/figma-chat/send.svg" alt="" /></button>
+                        <textarea id="composer-input" ref={composerRef} rows={1} maxLength={maxMessageLength} placeholder={pending?.contactId === selectedContact.id ? 'Adicionar legenda' : 'Mensagem'} value={draft} onKeyDown={composerKeyDown} onChange={(e) => setDrafts((all) => ({ ...all, [selectedContact.id]: e.target.value }))} />
+                        <button type="submit" disabled={sending || (!draft.trim() && pending?.contactId !== selectedContact.id)} aria-label="Enviar mensagem" title="Enviar (Enter)"><img src="/figma-chat/send.svg" alt="" /></button>
                       </form>
                     </div>
+                    {dropActive && <div className="drop-overlay" aria-hidden="true"><div><strong>Solte o arquivo aqui</strong><span>Imagens até 10 MB · PDF, documentos e compactados até 25 MB</span></div></div>}
                   </>
                 ) : (
                   <div className="welcome-view"><img src="/go-live-icon.png" alt="" /><h1>GO LIVE</h1><p>Selecione um contato para abrir a conversa.</p><span>Voz e compartilhamento de tela serão adicionados nas próximas etapas.</span></div>
@@ -596,6 +797,17 @@ function App() {
             )}
           </section>
         </>
+      )}
+      {lightbox?.attachment?.kind === 'image' && (
+        <div className="lightbox" role="dialog" aria-modal="true" aria-label="Imagem em tela cheia" onClick={(e) => { if (e.target === e.currentTarget) setLightbox(null) }}>
+          <header className="lightbox-bar">
+            <span><strong>{lightbox.senderId === user?.id ? 'Você' : contacts.find((c) => c.id === lightbox.senderId)?.username ?? 'Contato'}</strong><small>{dayLabel(lightbox.createdAt)} às {timeFormat.format(new Date(lightbox.createdAt))}</small></span>
+            <a className="lightbox-action" href={`${apiBase}${lightbox.attachment.url}?download=1`} title="Baixar imagem">Baixar</a>
+            <button ref={lightboxCloseRef} type="button" className="lightbox-action" onClick={() => setLightbox(null)} aria-label="Fechar imagem" title="Fechar (Esc)">×</button>
+          </header>
+          <img src={`${apiBase}${lightbox.attachment.url}`} alt={lightbox.body || 'Imagem enviada'} onClick={(e) => e.stopPropagation()} />
+          {lightbox.body && <p className="lightbox-caption">{lightbox.body}</p>}
+        </div>
       )}
       {toast && <div className="toast toast-top toast-end app-toast"><div className={`alert ${toast.kind === 'error' ? 'alert-error' : 'alert-success'} app-toast-alert`} role={toast.kind === 'error' ? 'alert' : 'status'}><span>{toast.message}</span><button type="button" className="app-toast-close" aria-label="Fechar notificação" onClick={() => setToast(null)}>×</button></div></div>}
     </main>
