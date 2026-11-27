@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent, type KeyboardEvent } from 'react'
 import './App.css'
 
 type User = {
@@ -14,9 +14,52 @@ type User = {
 type Toast = { kind: 'success' | 'error'; message: string }
 type Contact = Pick<User, 'id' | 'avatar' | 'username' | 'userTag' | 'status'>
 type Panel = 'chat' | 'profile' | 'admin'
+type Message = { id: number; senderId: string; recipientId: string; body: string; createdAt: string; readAt: string | null }
+type Conversation = { contactId: string; lastMessage: Message; unread: number }
+type Thread = { messages: Message[]; hasMore: boolean; loaded: boolean }
+type RealtimeEvent = { type: 'message'; message: Message } | { type: 'read'; readerId: string; readAt: string } | { type: 'presence'; userId: string; status: User['status'] }
 
 const apiBase = `http://localhost:${import.meta.env.VITE_PORT || '8081'}`
+const realtimeUrl = `${apiBase.replace(/^http/, 'ws')}/api/ws`
+const pageSize = 50
+const maxMessageLength = 4000
 const avatarSource = (path: string) => path.startsWith('/api/avatars/') ? `${apiBase}${path}` : path
+
+function mergeMessages(current: Message[], incoming: Message[]) {
+  const byId = new Map(current.map((m) => [m.id, m]))
+  for (const m of incoming) byId.set(m.id, { ...byId.get(m.id), ...m })
+  return [...byId.values()].sort((a, b) => a.id - b.id)
+}
+
+const timeFormat = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' })
+const dateFormat = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: 'long', year: 'numeric' })
+const shortDateFormat = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' })
+
+function dayLabel(iso: string) {
+  const date = new Date(iso)
+  const today = new Date()
+  const yesterday = new Date(); yesterday.setDate(today.getDate() - 1)
+  if (date.toDateString() === today.toDateString()) return 'Hoje'
+  if (date.toDateString() === yesterday.toDateString()) return 'Ontem'
+  return dateFormat.format(date)
+}
+
+function previewTime(iso: string) {
+  const date = new Date(iso)
+  return date.toDateString() === new Date().toDateString() ? timeFormat.format(date) : shortDateFormat.format(date)
+}
+
+function ReadTicks({ message }: { message: Message }) {
+  const read = !!message.readAt
+  const label = read ? `Lida às ${timeFormat.format(new Date(message.readAt!))}` : 'Enviada, ainda não lida'
+  return (
+    <span className={`ticks ${read ? 'read' : 'sent'}`} role="img" aria-label={label} title={label}>
+      <svg viewBox="0 0 18 12" width="18" height="12" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M1 6.5 4.5 10 11 2" /><path d="M7.5 9 8.5 10 15 2" />
+      </svg>
+    </span>
+  )
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${apiBase}${path}`, {
@@ -35,6 +78,7 @@ function App() {
   const [user, setUser] = useState<User | null>(null)
   const [users, setUsers] = useState<User[]>([])
   const [contacts, setContacts] = useState<Contact[]>([])
+  const [selectedContactId, setSelectedContactId] = useState<string | null>(null)
   const [panel, setPanel] = useState<Panel>('chat')
   const [search, setSearch] = useState('')
   const [ready, setReady] = useState(false)
@@ -53,6 +97,23 @@ function App() {
   const [showPasswords, setShowPasswords] = useState(false)
   const avatarInputRef = useRef<HTMLInputElement>(null)
   const [newUser, setNewUser] = useState({ username: '', email: '', userTag: '', password: '' })
+  const [conversations, setConversations] = useState<Record<string, Conversation>>({})
+  const [threads, setThreads] = useState<Record<string, Thread>>({})
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [sending, setSending] = useState(false)
+  const [loadingOlder, setLoadingOlder] = useState(false)
+  const [connected, setConnected] = useState(true)
+  const [visible, setVisible] = useState(() => document.visibilityState === 'visible')
+  const canvasRef = useRef<HTMLDivElement>(null)
+  const composerRef = useRef<HTMLTextAreaElement>(null)
+  const stickToBottom = useRef(true)
+  const olderAnchor = useRef<number | null>(null)
+  const userIdRef = useRef<string | null>(null)
+  const selectedRef = useRef<string | null>(null)
+  useLayoutEffect(() => {
+    userIdRef.current = user?.id ?? null
+    selectedRef.current = panel === 'chat' ? selectedContactId : null
+  })
 
   function notify(kind: Toast['kind'], message: string) {
     setToast({ kind, message })
@@ -82,9 +143,161 @@ function App() {
     request<Contact[]>('/api/contacts').then(setContacts).catch((err: Error) => notify('error', err.message))
   }, [user?.id])
 
-  function clearSession() {
-    setUser(null); setUsers([]); setContacts([]); setPanel('chat')
+  const loadConversations = useCallback(() => {
+    request<Conversation[]>('/api/conversations')
+      .then((list) => setConversations(Object.fromEntries(list.map((c) => [c.contactId, c]))))
+      .catch((err: Error) => notify('error', err.message))
+  }, [])
+
+  const loadThread = useCallback(async (contactId: string) => {
+    try {
+      const list = await request<Message[]>(`/api/conversations/${contactId}/messages?limit=${pageSize}`)
+      setThreads((all) => {
+        const previous = all[contactId]
+        return { ...all, [contactId]: { messages: mergeMessages(previous?.messages ?? [], list), hasMore: previous?.loaded ? previous.hasMore : list.length === pageSize, loaded: true } }
+      })
+    } catch (err) { notify('error', (err as Error).message) }
+  }, [])
+
+  const receive = useCallback((message: Message) => {
+    const me = userIdRef.current
+    if (!me) return
+    const contactId = message.senderId === me ? message.recipientId : message.senderId
+    setThreads((all) => all[contactId] ? { ...all, [contactId]: { ...all[contactId], messages: mergeMessages(all[contactId].messages, [message]) } } : all)
+    setConversations((all) => {
+      const current = all[contactId]
+      if (current && current.lastMessage.id >= message.id) return all
+      const isNewIncoming = message.senderId === contactId && !message.readAt
+      return { ...all, [contactId]: { contactId, lastMessage: message, unread: (current?.unread ?? 0) + (isNewIncoming ? 1 : 0) } }
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!user?.id) return
+    loadConversations()
+    let socket: WebSocket | null = null
+    let retry = 0
+    let timer: number | undefined
+    let stopped = false
+    const connect = () => {
+      socket = new WebSocket(realtimeUrl)
+      socket.onopen = () => {
+        setConnected(true)
+        if (retry > 0) {
+          loadConversations()
+          request<Contact[]>('/api/contacts').then(setContacts).catch(() => {})
+          if (selectedRef.current) void loadThread(selectedRef.current)
+        }
+        retry = 0
+      }
+      socket.onmessage = (event) => {
+        let data: RealtimeEvent
+        try { data = JSON.parse(event.data) } catch { return }
+        if (data.type === 'message') receive(data.message)
+        if (data.type === 'presence') {
+          const { userId, status } = data
+          setContacts((list) => list.map((contact) => contact.id === userId ? { ...contact, status } : contact))
+        }
+        if (data.type === 'read') {
+          const mark = (m: Message) => m.recipientId === data.readerId && !m.readAt ? { ...m, readAt: data.readAt } : m
+          setThreads((all) => all[data.readerId] ? { ...all, [data.readerId]: { ...all[data.readerId], messages: all[data.readerId].messages.map(mark) } } : all)
+          setConversations((all) => all[data.readerId] ? { ...all, [data.readerId]: { ...all[data.readerId], lastMessage: mark(all[data.readerId].lastMessage) } } : all)
+        }
+      }
+      socket.onclose = () => {
+        if (stopped) return
+        setConnected(false)
+        retry += 1
+        timer = window.setTimeout(connect, Math.min(15000, 1000 * 2 ** Math.min(retry - 1, 4)))
+      }
+    }
+    connect()
+    return () => { stopped = true; window.clearTimeout(timer); socket?.close() }
+  }, [user?.id, loadConversations, loadThread, receive])
+
+  useEffect(() => {
+    const onVisibility = () => setVisible(document.visibilityState === 'visible')
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [])
+
+  useEffect(() => {
+    if (!selectedContactId || panel !== 'chat') return
+    stickToBottom.current = true
+    if (!threads[selectedContactId]?.loaded) void loadThread(selectedContactId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedContactId, panel, loadThread])
+
+  const openThread = selectedContactId && panel === 'chat' ? threads[selectedContactId] : undefined
+  const hasUnreadOpen = !!selectedContactId && !!openThread?.messages.some((m) => m.senderId === selectedContactId && !m.readAt)
+
+  useEffect(() => {
+    if (!selectedContactId || !hasUnreadOpen || !visible) return
+    const contactId = selectedContactId
+    const now = new Date().toISOString()
+    setThreads((all) => all[contactId] ? { ...all, [contactId]: { ...all[contactId], messages: all[contactId].messages.map((m) => m.senderId === contactId && !m.readAt ? { ...m, readAt: now } : m) } } : all)
+    setConversations((all) => all[contactId] ? { ...all, [contactId]: { ...all[contactId], unread: 0 } } : all)
+    request<void>(`/api/conversations/${contactId}/read`, { method: 'POST' }).catch(() => {})
+  }, [selectedContactId, hasUnreadOpen, visible])
+
+  useLayoutEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    if (olderAnchor.current !== null) {
+      canvas.scrollTop = canvas.scrollHeight - olderAnchor.current
+      olderAnchor.current = null
+    } else if (stickToBottom.current) {
+      canvas.scrollTop = canvas.scrollHeight
+    }
+  }, [openThread?.messages])
+
+  async function loadOlder() {
+    if (!selectedContactId || !openThread?.messages.length) return
+    const contactId = selectedContactId
+    setLoadingOlder(true)
+    try {
+      const list = await request<Message[]>(`/api/conversations/${contactId}/messages?limit=${pageSize}&before=${openThread.messages[0].id}`)
+      olderAnchor.current = canvasRef.current ? canvasRef.current.scrollHeight - canvasRef.current.scrollTop : null
+      setThreads((all) => ({ ...all, [contactId]: { messages: mergeMessages(all[contactId]?.messages ?? [], list), hasMore: list.length === pageSize, loaded: true } }))
+    } catch (err) { notify('error', (err as Error).message) }
+    finally { setLoadingOlder(false) }
   }
+
+  async function sendMessage(event?: FormEvent) {
+    event?.preventDefault()
+    if (!selectedContactId || sending) return
+    const contactId = selectedContactId
+    const body = (drafts[contactId] ?? '').trim()
+    if (!body) return
+    if (body.length > maxMessageLength) { notify('error', `A mensagem pode ter até ${maxMessageLength} caracteres.`); return }
+    setSending(true)
+    try {
+      const message = await request<Message>(`/api/conversations/${contactId}/messages`, { method: 'POST', body: JSON.stringify({ body }) })
+      stickToBottom.current = true
+      setDrafts((all) => ({ ...all, [contactId]: '' }))
+      receive(message)
+    } catch (err) { notify('error', (err as Error).message) }
+    finally { setSending(false); composerRef.current?.focus() }
+  }
+
+  function composerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault()
+      void sendMessage()
+    }
+  }
+
+  function clearSession() {
+    setUser(null); setUsers([]); setContacts([]); setSelectedContactId(null); setPanel('chat')
+    setConversations({}); setThreads({}); setDrafts({})
+  }
+
+  useLayoutEffect(() => {
+    const field = composerRef.current
+    if (!field) return
+    field.style.height = 'auto'
+    field.style.height = `${Math.min(field.scrollHeight, 140)}px`
+  }, [drafts, selectedContactId])
 
   async function login(event: FormEvent) {
     event.preventDefault()
@@ -176,6 +389,7 @@ function App() {
       setUsers((list) => list.map((u) => u.id === target.id ? { ...u, accountStatus: next } : u))
       if (next === 'blocked') {
         setContacts((list) => list.filter((contact) => contact.id !== target.id))
+        if (selectedContactId === target.id) setSelectedContactId(null)
       } else {
         setContacts((list) => [...list, { id: target.id, avatar: target.avatar, username: target.username, userTag: target.userTag, status: target.status }].sort((a, b) => a.username.localeCompare(b.username)))
       }
@@ -183,8 +397,11 @@ function App() {
     } catch (err) { notify('error', (err as Error).message) }
   }
 
+  const selectedContact = contacts.find((contact) => contact.id === selectedContactId)
   const filteredContacts = contacts
     .filter((contact) => `${contact.username} ${contact.userTag}`.toLocaleLowerCase().includes(search.toLocaleLowerCase()))
+    .sort((a, b) => (conversations[b.id]?.lastMessage.id ?? 0) - (conversations[a.id]?.lastMessage.id ?? 0))
+  const draft = selectedContactId ? drafts[selectedContactId] ?? '' : ''
 
   return (
     <main className={user ? 'chat-app' : 'auth-shell'}>
@@ -204,7 +421,7 @@ function App() {
         </>
       ) : (
         <>
-          <aside className={`chat-sidebar ${panel !== 'chat' ? 'mobile-hidden' : ''}`} aria-label="Contatos">
+          <aside className={`chat-sidebar ${selectedContact && panel === 'chat' || panel !== 'chat' ? 'mobile-hidden' : ''}`} aria-label="Conversas">
             <div className="sidebar-search">
               <button className="icon-button" type="button" aria-label="Abrir perfil" title="Abrir perfil" onClick={() => setPanel(panel === 'profile' ? 'chat' : 'profile')}><img src="/figma-chat/menu.svg" alt="" /></button>
               <label className="search-box"><img src="/figma-chat/search.svg" alt="" /><span className="sr-only">Buscar contatos</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar" /></label>
@@ -212,16 +429,16 @@ function App() {
             <div className="sidebar-label"><span>Contatos</span><span>{contacts.length}</span></div>
             <div className="contact-list">
               {filteredContacts.length ? filteredContacts.map((contact) => (
-                <div key={contact.id} className="contact-item">
+                <button key={contact.id} type="button" className={`contact-item ${selectedContactId === contact.id && panel === 'chat' ? 'selected' : ''}`} onClick={() => { setSelectedContactId(contact.id); setPanel('chat') }}>
                   {contact.avatar ? <img className="contact-avatar" src={avatarSource(contact.avatar)} alt="" /> : <span className="contact-avatar contact-placeholder">{contact.username.slice(0, 1).toUpperCase()}</span>}
                   <span className="contact-text">
-                    <span className="contact-line"><strong>{contact.username}</strong></span>
+                    <span className="contact-line"><strong>{contact.username}</strong>{conversations[contact.id] && <time className="contact-time" dateTime={conversations[contact.id].lastMessage.createdAt}>{previewTime(conversations[contact.id].lastMessage.createdAt)}</time>}</span>
                     <span className="contact-line">
-                      <small>@{contact.userTag}</small>
-                      <span className={`presence-dot ${contact.status}`} aria-label={contact.status} />
+                      <small className="contact-preview">{conversations[contact.id]?.lastMessage.senderId === user.id && <ReadTicks message={conversations[contact.id].lastMessage} />}{conversations[contact.id] ? <>{conversations[contact.id].lastMessage.senderId === user.id && 'Você: '}{conversations[contact.id].lastMessage.body}</> : `@${contact.userTag}`}</small>
+                      {conversations[contact.id]?.unread ? <span className="unread-badge" aria-label={`${conversations[contact.id].unread} não lidas`}>{conversations[contact.id].unread > 99 ? '99+' : conversations[contact.id].unread}</span> : <span className={`presence-dot ${contact.status}`} aria-label={contact.status} />}
                     </span>
                   </span>
-                </div>
+                </button>
               )) : <p className="sidebar-empty">{search ? 'Nenhum contato encontrado.' : 'Ainda não há outros usuários ativos.'}</p>}
             </div>
             <div className="sidebar-footer">
@@ -232,13 +449,60 @@ function App() {
               {user.role === 'master' && <button className="admin-shortcut" type="button" onClick={() => setPanel('admin')}>Admin</button>}
             </div>
           </aside>
-          <section className={`chat-main ${panel !== 'chat' ? 'mobile-open' : ''}`}>
+          <section className={`chat-main ${selectedContact && panel === 'chat' || panel !== 'chat' ? 'mobile-open' : ''}`}>
             {panel === 'chat' ? (
-              <div className="welcome-view"><img src="/go-live-icon.png" alt="" /><h1>GO LIVE</h1><p>Sua conta está pronta.</p><span>O chat de texto, a voz e o compartilhamento de tela serão adicionados nas próximas etapas.</span></div>
+              <>
+                {selectedContact ? (
+                  <>
+                    <header className="conversation-header">
+                      <button className="mobile-back" type="button" onClick={() => setSelectedContactId(null)} aria-label="Voltar aos contatos">‹</button>
+                      {selectedContact.avatar ? <img className="header-avatar" src={avatarSource(selectedContact.avatar)} alt="" /> : <span className="header-avatar contact-placeholder">{selectedContact.username.slice(0, 1).toUpperCase()}</span>}
+                      <div className="conversation-identity"><strong>{selectedContact.username}</strong><small>{connected ? <>@{selectedContact.userTag} · {selectedContact.status === 'online' ? 'online' : selectedContact.status === 'busy' ? 'ocupado' : selectedContact.status === 'away' ? 'ausente' : 'offline'}</> : 'Reconectando…'}</small></div>
+                      <button className="icon-button header-action" type="button" onClick={() => notify('success', 'Busca de mensagens chega na próxima etapa.')} aria-label="Buscar mensagens" title="Buscar mensagens"><img src="/figma-chat/search-header.svg" alt="" /></button>
+                      <button className="icon-button header-action" type="button" onClick={() => notify('success', 'Chamadas de voz chegam em uma próxima etapa.')} aria-label="Iniciar chamada" title="Chamada em breve"><img src="/figma-chat/call.svg" alt="" /></button>
+                      <button className="icon-button header-action" type="button" onClick={() => setPanel('profile')} aria-label="Mais opções" title="Mais opções"><img src="/figma-chat/more.svg" alt="" /></button>
+                    </header>
+                    <div className="conversation-canvas" ref={canvasRef} onScroll={(e) => { const el = e.currentTarget; stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80 }}>
+                      {!openThread?.loaded ? <p className="thread-status">Carregando mensagens…</p> : !openThread.messages.length ? (
+                        <div className="empty-conversation"><span className="empty-mark">✦</span><h1>Conversa com {selectedContact.username}</h1><p>Nenhuma mensagem ainda. Diga olá!</p></div>
+                      ) : (
+                        <ol className="message-list" aria-label={`Mensagens com ${selectedContact.username}`}>
+                          {openThread.hasMore && <li className="load-older"><button type="button" disabled={loadingOlder} onClick={loadOlder}>{loadingOlder ? 'Carregando…' : 'Carregar mensagens anteriores'}</button></li>}
+                          {openThread.messages.map((m, index) => {
+                            const mine = m.senderId === user.id
+                            const previous = openThread.messages[index - 1]
+                            const newDay = !previous || new Date(previous.createdAt).toDateString() !== new Date(m.createdAt).toDateString()
+                            return (
+                              <li key={m.id} className="message-row-wrap">
+                                {newDay && <div className="day-separator"><span>{dayLabel(m.createdAt)}</span></div>}
+                                <div className={`message-row ${mine ? 'mine' : 'theirs'} ${previous && previous.senderId === m.senderId && !newDay ? 'grouped' : ''}`}>
+                                  <div className="bubble">
+                                    <p>{m.body}</p>
+                                    <span className="bubble-meta"><time dateTime={m.createdAt}>{timeFormat.format(new Date(m.createdAt))}</time>{mine && <ReadTicks message={m} />}</span>
+                                  </div>
+                                </div>
+                              </li>
+                            )
+                          })}
+                        </ol>
+                      )}
+                    </div>
+                    <div className="composer-area">
+                      <form className="composer" onSubmit={sendMessage}>
+                        <label className="sr-only" htmlFor="composer-input">Mensagem para {selectedContact.username}</label>
+                        <textarea id="composer-input" ref={composerRef} rows={1} maxLength={maxMessageLength} placeholder="Mensagem" value={draft} onKeyDown={composerKeyDown} onChange={(e) => setDrafts((all) => ({ ...all, [selectedContact.id]: e.target.value }))} />
+                        <button type="submit" disabled={sending || !draft.trim()} aria-label="Enviar mensagem" title="Enviar (Enter)"><img src="/figma-chat/send.svg" alt="" /></button>
+                      </form>
+                    </div>
+                  </>
+                ) : (
+                  <div className="welcome-view"><img src="/go-live-icon.png" alt="" /><h1>GO LIVE</h1><p>Selecione um contato para abrir a conversa.</p><span>Voz e compartilhamento de tela serão adicionados nas próximas etapas.</span></div>
+                )}
+              </>
             ) : (
               <div className="settings-view">
                 <header className="settings-header">
-                  <button className="icon-button settings-back" type="button" onClick={() => setPanel('chat')} aria-label="Voltar" title="Voltar">
+                  <button className="icon-button settings-back" type="button" onClick={() => setPanel('chat')} aria-label="Voltar ao chat" title="Voltar ao chat">
                     <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M15 18 9 12l6-6" /></svg>
                   </button>
                   <h1>{panel === 'admin' ? 'Administração' : 'Meu perfil'}</h1>

@@ -13,6 +13,7 @@ import (
 
 	"github.com/Darrkkens/go-live/internal/accounts"
 	"github.com/Darrkkens/go-live/internal/database"
+	"github.com/Darrkkens/go-live/internal/messages"
 )
 
 type Server struct {
@@ -20,6 +21,8 @@ type Server struct {
 
 	db       database.Service
 	accounts accounts.Store
+	messages messages.Store
+	hub      *hub
 }
 
 func NewServer() *http.Server {
@@ -30,10 +33,15 @@ func NewServer() *http.Server {
 		db: database.New(),
 	}
 	NewServer.accounts = accounts.Store{DB: NewServer.db.DB()}
+	NewServer.messages = messages.Store{DB: NewServer.db.DB()}
+	NewServer.hub = newHub()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := NewServer.accounts.Migrate(ctx); err != nil {
 		log.Fatalf("database migration failed: %v", err)
+	}
+	if err := NewServer.messages.Migrate(ctx); err != nil {
+		log.Fatalf("messages migration failed: %v", err)
 	}
 
 	// Declare Server config

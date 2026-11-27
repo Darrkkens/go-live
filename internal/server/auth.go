@@ -79,6 +79,9 @@ func (s *Server) logout(c *gin.Context) {
 		return
 	}
 	if token, err := c.Cookie(sessionCookie); err == nil {
+		if u, err := s.accounts.Session(c.Request.Context(), token); err == nil {
+			defer s.hub.disconnect(u.ID, tokenDigest(token))
+		}
 		_ = s.accounts.Logout(c.Request.Context(), token)
 	}
 	c.SetSameSite(http.SameSiteLaxMode)
@@ -112,6 +115,9 @@ func (s *Server) updateMe(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Status inválido."})
 		return
 	}
+	if s.hub.online(u.ID) {
+		s.broadcastPresence(u.ID, updated.Status)
+	}
 	c.JSON(http.StatusOK, updated)
 }
 
@@ -144,6 +150,7 @@ func (s *Server) changePassword(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível alterar a senha."})
 		return
 	}
+	s.hub.disconnect(u.ID, "")
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(sessionCookie, "", -1, "/", "", strings.EqualFold(os.Getenv("APP_ENV"), "production"), true)
 	c.Status(http.StatusNoContent)
@@ -170,6 +177,12 @@ func (s *Server) listContacts(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível listar contatos."})
 		return
+	}
+	// The chosen status only applies while the contact has the app open.
+	for i := range contacts {
+		if !s.hub.online(contacts[i].ID) {
+			contacts[i].Status = "offline"
+		}
 	}
 	c.JSON(http.StatusOK, contacts)
 }
@@ -224,6 +237,9 @@ func (s *Server) updateUserStatus(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Usuário não encontrado."})
 		return
+	}
+	if body.AccountStatus == "blocked" {
+		s.hub.disconnect(c.Param("id"), "")
 	}
 	c.Status(http.StatusNoContent)
 }

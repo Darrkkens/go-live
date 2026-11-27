@@ -37,6 +37,11 @@ func (s *Server) RegisterRoutes() http.Handler {
 	r.GET("/api/contacts", s.listContacts)
 	r.POST("/api/users", s.createUser)
 	r.PATCH("/api/users/:id/status", s.updateUserStatus)
+	r.GET("/api/conversations", s.listConversations)
+	r.GET("/api/conversations/:contactId/messages", s.listMessages)
+	r.POST("/api/conversations/:contactId/messages", s.sendMessage)
+	r.POST("/api/conversations/:contactId/read", s.markRead)
+	r.GET("/api/ws", s.realtime)
 
 	return r
 }

@@ -41,6 +41,18 @@ The API listens on `http://localhost:8081`; Vite serves the frontend on `http://
 
 The master signs in with email or `@userTag` and creates user accounts. Users can upload an avatar by dragging an image or choosing a file, and can update their presence status and password. Avatars accept PNG or JPEG up to 4 MB and 2048 × 2048 pixels. Files are stored in `AVATAR_DIR` (default `data/avatars`); keep this directory persistent when deploying. Account access status (`active` or `blocked`) is managed by the master. Passwords are stored as Argon2id hashes; session tokens are stored as SHA-256 digests in Postgres. There is no public registration.
 
+After login, the chat screen lists active users as contacts, ordered by the most recent conversation, with the last message preview and an unread count. Selecting a contact opens a one-to-one text conversation: messages are stored in Postgres (`direct_messages`), up to 4000 characters each, and load 50 at a time with a button for older ones. Enter sends and Shift+Enter adds a line break. New messages and read receipts (✓ sent, ✓✓ read) arrive in real time over an authenticated WebSocket at `/api/ws`; the browser reconnects automatically and reloads conversations after a reconnect. Logging out, changing the password, or being blocked closes that user's WebSocket. Presence also updates in real time: a contact shows their chosen status (online, away, busy) while they have the app open and appears offline when their last tab closes; choosing `offline` hides them. Voice calls and screen sharing are upcoming stages. The layout uses the provided Chatgram Figma UI kit as a visual reference.
+
+Text chat API (session cookie required; `POST` requests must come from `FRONTEND_ORIGIN`):
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/conversations` | Last message and unread count per contact |
+| `GET` | `/api/conversations/:contactId/messages?before=ID&limit=50` | History, oldest first |
+| `POST` | `/api/conversations/:contactId/messages` | Send `{ "body": "..." }` |
+| `POST` | `/api/conversations/:contactId/read` | Mark the contact's messages as read |
+| `GET` | `/api/ws` | WebSocket with `message`, `read` and `presence` events |
+
 ## Verify
 
 ```sh
