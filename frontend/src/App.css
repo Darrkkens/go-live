@@ -17,6 +17,8 @@
 .contact-placeholder { background: #8babd8; color: #fff; font-size: 16px; font-weight: 600; }
 .contact-text { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
 .contact-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+.contact-time { flex: none; color: #707991; font-size: 12px; }
+.unread-badge { display: grid; place-items: center; min-width: 22px; height: 22px; flex: none; padding: 0 6px; border-radius: 11px; background: #78e378; color: #fff; font-size: 12px; font-weight: 700; }
 .contact-text strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; font-weight: 600; line-height: 20px; }
 .contact-text small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #707991; font-size: 14px; line-height: 18px; }
 .presence-dot { width: 9px; height: 9px; flex: none; border-radius: 50%; background: #b4bdca; }
@@ -33,7 +35,49 @@
 .small-avatar { display: grid; place-items: center; width: 36px; height: 36px; flex: none; border-radius: 50%; object-fit: cover; }
 .admin-shortcut { flex: none; padding: 8px 10px; border: 0; border-radius: 8px; background: #fff; color: #3776bd; font-size: 13px; font-weight: 600; cursor: pointer; }
 .chat-main { position: relative; isolation: isolate; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: #8babd8; }
+.conversation-header { display: flex; align-items: center; gap: 16px; height: 56px; min-height: 56px; padding: 8px 16px; background: #fff; border-bottom: 1px solid #d9dce0; }
+.header-avatar { display: grid; place-items: center; width: 40px; height: 40px; flex: none; border-radius: 50%; object-fit: cover; }
+.conversation-identity { display: flex; flex-direction: column; flex: 1; min-width: 0; gap: 2px; }
+.conversation-identity strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; font-weight: 600; line-height: 20px; }
+.conversation-identity small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #707991; font-size: 14px; line-height: 18px; }
+.conversation-canvas { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; overflow-y: auto; isolation: isolate; }
 .chat-main::before { content: ''; position: absolute; z-index: -1; inset: 0; background-image: url('/figma-chat/bg-print.png'); background-repeat: repeat; background-position: top left; background-size: 674px auto; mix-blend-mode: overlay; opacity: .45; pointer-events: none; }
+.thread-status { margin: auto; padding: 8px 16px; border-radius: 18px; background: rgba(255,255,255,.9); color: #011627; }
+.message-list { display: flex; flex-direction: column; width: min(694px,100%); margin: auto auto 0; padding: 16px 16px 12px; list-style: none; }
+.message-row { position: relative; display: flex; margin-top: 8px; }
+.message-row.grouped { margin-top: 2px; }
+.message-row.mine { justify-content: flex-end; }
+.bubble { position: relative; max-width: min(520px,80%); padding: 6px 10px 6px 12px; border-radius: 12px; background: #fff; color: #011627; box-shadow: 0 1px 1px rgba(1,22,39,.12); }
+.message-row.mine .bubble { background: #effedd; }
+.message-row.theirs:not(.grouped) .bubble { border-top-left-radius: 4px; }
+.message-row.mine:not(.grouped) .bubble { border-top-right-radius: 4px; }
+.bubble p { display: inline; margin: 0; font-size: 15px; line-height: 20px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.bubble-meta { float: right; display: inline-flex; align-items: center; gap: 3px; margin: 6px 0 -4px 10px; color: #707991; font-size: 11px; line-height: 14px; }
+.message-row.mine .bubble-meta { color: #5fa05f; }
+.ticks { display: inline-flex; flex: none; }
+.ticks svg { display: block; }
+.ticks.sent { color: #8f9ba8; }
+.ticks.read { color: #1d8cf8; }
+.contact-preview .ticks { margin-right: 4px; vertical-align: -1px; }
+.contact-text small.contact-preview { display: block; }
+.contact-preview .ticks { display: inline-flex; }
+.day-separator { display: flex; justify-content: center; margin: 14px 0 4px; }
+.day-separator span { padding: 4px 12px; border-radius: 14px; background: rgba(1,22,39,.28); color: #fff; font-size: 12px; font-weight: 600; }
+.load-older { display: flex; justify-content: center; margin-bottom: 4px; }
+.load-older button { min-height: 32px; padding: 6px 14px; border: 0; border-radius: 16px; background: rgba(255,255,255,.9); color: #3776bd; font-size: 13px; font-weight: 600; cursor: pointer; }
+.load-older button:disabled { cursor: wait; opacity: .7; }
+.empty-conversation { margin: auto; max-width: min(420px,calc(100% - 32px)); padding: 24px; border-radius: 16px; background: rgba(255,255,255,.92); text-align: center; box-shadow: 0 12px 32px rgba(18,51,103,.12); }
+.empty-conversation h1 { margin: 8px 0; font-size: 21px; }
+.empty-conversation p { margin: 0; color: #707991; }
+.empty-mark { color: #5195db; font-size: 30px; }
+.composer-area { padding: 0 16px 24px; }
+.composer { display: flex; align-items: flex-end; gap: 16px; width: min(694px,100%); min-height: 56px; margin: 0 auto; padding: 8px 16px; border-radius: 12px; background: #fff; color: #707991; }
+.composer > img { display: block; flex: none; margin-bottom: 4px; }
+.composer textarea { flex: 1; min-width: 0; max-height: 140px; padding: 6px 0; border: 0; outline: 0; resize: none; background: transparent; color: #011627; font: inherit; font-size: 16px; line-height: 22px; }
+.composer textarea::placeholder { color: #707991; }
+.composer button { display: grid; place-items: center; width: 32px; height: 32px; min-height: 32px; flex: none; padding: 0; border: 0; background: transparent; cursor: pointer; }
+.composer button:disabled { opacity: .4; cursor: default; }
+.composer button img { display: block; }
 .welcome-view { position: relative; display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; overflow: hidden; isolation: isolate; padding: 32px; text-align: center; }
 .welcome-view > img { width: 110px; height: 110px; object-fit: contain; }
 .welcome-view h1 { margin: 8px 0 0; color: #fff; font-size: 28px; letter-spacing: .05em; }

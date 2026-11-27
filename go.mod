@@ -3,6 +3,7 @@ module github.com/Darrkkens/go-live
 go 1.27.1
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/gin-contrib/cors v1.7.11
 	github.com/gin-gonic/gin v1.12.0
 	github.com/google/uuid v1.6.0

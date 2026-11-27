@@ -1,0 +1,123 @@
+package messages
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Darrkkens/go-live/internal/accounts"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
+)
+
+func TestNormalizeBody(t *testing.T) {
+	if got, err := NormalizeBody("  oi\r\ntudo bem?  "); err != nil || got != "oi\ntudo bem?" {
+		t.Fatalf("got %q %v", got, err)
+	}
+	for _, bad := range []string{"", "   \n ", strings.Repeat("a", MaxBodyRunes+1), "\xff"} {
+		if _, err := NormalizeBody(bad); err != ErrInvalid {
+			t.Fatalf("expected invalid for %q", bad)
+		}
+	}
+	if _, err := NormalizeBody(strings.Repeat("é", MaxBodyRunes)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMessageFlow(t *testing.T) {
+	ctx := context.Background()
+	container, err := postgres.Run(ctx, "postgres:latest", postgres.WithDatabase("go_live"), postgres.WithUsername("test"), postgres.WithPassword("test"), testcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(60*time.Second)))
+	if err != nil {
+		t.Skipf("Docker unavailable: %v", err)
+	}
+	defer container.Terminate(ctx)
+	host, _ := container.Host(ctx)
+	port, err := container.MappedPort(ctx, "5432/tcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("pgx", fmt.Sprintf("postgres://test:test@%s:%s/go_live?sslmode=disable", host, port.Port()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	users := accounts.Store{DB: db}
+	store := Store{DB: db}
+	if err := users.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ana, _ := users.Create(ctx, accounts.CreateInput{Username: "Ana", Email: "ana@example.com", UserTag: "ana", Password: "long secure password"}, "user")
+	bia, _ := users.Create(ctx, accounts.CreateInput{Username: "Bia", Email: "bia@example.com", UserTag: "bia", Password: "long secure password"}, "user")
+	caio, _ := users.Create(ctx, accounts.CreateInput{Username: "Caio", Email: "caio@example.com", UserTag: "caio", Password: "long secure password"}, "user")
+
+	if _, err := store.Send(ctx, ana.ID, ana.ID, "eu"); err != ErrRecipient {
+		t.Fatalf("self message: %v", err)
+	}
+	for i := 1; i <= 5; i++ {
+		from, to := ana.ID, bia.ID
+		if i%2 == 0 {
+			from, to = bia.ID, ana.ID
+		}
+		if _, err := store.Send(ctx, from, to, fmt.Sprintf("msg %d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.Send(ctx, caio.ID, ana.ID, "oi Ana"); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := store.History(ctx, bia.ID, ana.ID, 0, 0)
+	if err != nil || len(all) != 5 || all[0].Body != "msg 1" || all[4].Body != "msg 5" {
+		t.Fatalf("history: %v %v", all, err)
+	}
+	page, err := store.History(ctx, ana.ID, bia.ID, all[3].ID, 2)
+	if err != nil || len(page) != 2 || page[0].Body != "msg 2" || page[1].Body != "msg 3" {
+		t.Fatalf("paged history: %v %v", page, err)
+	}
+	if other, _ := store.History(ctx, caio.ID, bia.ID, 0, 0); len(other) != 0 {
+		t.Fatalf("unrelated history leaked: %v", other)
+	}
+
+	convs, err := store.Conversations(ctx, ana.ID)
+	if err != nil || len(convs) != 2 {
+		t.Fatalf("conversations: %v %v", convs, err)
+	}
+	unread := map[string]int{}
+	for _, c := range convs {
+		unread[c.ContactID] = c.Unread
+	}
+	if unread[bia.ID] != 2 || unread[caio.ID] != 1 {
+		t.Fatalf("unread: %v", unread)
+	}
+	if _, n, err := store.MarkRead(ctx, ana.ID, bia.ID); err != nil || n != 2 {
+		t.Fatalf("mark read: %d %v", n, err)
+	}
+	if _, n, _ := store.MarkRead(ctx, ana.ID, bia.ID); n != 0 {
+		t.Fatalf("second mark read changed %d", n)
+	}
+	if after, _ := store.History(ctx, ana.ID, bia.ID, 0, 0); after[1].ReadAt == nil || after[0].ReadAt != nil {
+		t.Fatalf("read flags: %+v", after)
+	}
+
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("migration not idempotent: %v", err)
+	}
+
+	if err := users.SetAccountStatus(ctx, caio.ID, "blocked"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Send(ctx, ana.ID, caio.ID, "oi"); err != ErrRecipient {
+		t.Fatalf("blocked recipient: %v", err)
+	}
+	if convs, _ := store.Conversations(ctx, ana.ID); len(convs) != 1 || convs[0].ContactID != bia.ID || convs[0].Unread != 0 {
+		t.Fatalf("conversations after block: %+v", convs)
+	}
+}
