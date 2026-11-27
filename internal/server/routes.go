@@ -41,6 +41,8 @@ func (s *Server) RegisterRoutes() http.Handler {
 	r.GET("/api/conversations/:contactId/messages", s.listMessages)
 	r.POST("/api/conversations/:contactId/messages", s.sendMessage)
 	r.POST("/api/conversations/:contactId/read", s.markRead)
+	r.POST("/api/conversations/:contactId/attachments", s.sendAttachment)
+	r.GET("/api/messages/:id/attachment", s.getAttachment)
 	r.GET("/api/ws", s.realtime)
 
 	return r

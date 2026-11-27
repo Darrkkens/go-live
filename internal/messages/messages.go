@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -18,12 +20,35 @@ var ErrInvalid = errors.New("invalid message")
 var ErrRecipient = errors.New("recipient not available")
 
 type Message struct {
-	ID          int64      `json:"id"`
-	SenderID    string     `json:"senderId"`
-	RecipientID string     `json:"recipientId"`
-	Body        string     `json:"body"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	ReadAt      *time.Time `json:"readAt"`
+	ID          int64       `json:"id"`
+	SenderID    string      `json:"senderId"`
+	RecipientID string      `json:"recipientId"`
+	Body        string      `json:"body"`
+	Attachment  *Attachment `json:"attachment"`
+	CreatedAt   time.Time   `json:"createdAt"`
+	ReadAt      *time.Time  `json:"readAt"`
+}
+
+// Attachment is an image or document stored on disk; FileName never leaves the server.
+type Attachment struct {
+	FileName    string `json:"-"`
+	Kind        string `json:"kind"`
+	ContentType string `json:"contentType"`
+	Name        string `json:"name"`
+	Size        int64  `json:"size"`
+	Width       int    `json:"width,omitempty"`
+	Height      int    `json:"height,omitempty"`
+	URL         string `json:"url"`
+}
+
+func (a Attachment) valid() bool {
+	if a.FileName == "" || a.ContentType == "" || a.Name == "" || a.Size < 1 {
+		return false
+	}
+	if strings.HasPrefix(a.ContentType, "image/") {
+		return a.Width > 0 && a.Height > 0
+	}
+	return a.Width == 0 && a.Height == 0
 }
 
 type Conversation struct {
@@ -45,21 +70,46 @@ func (s Store) Migrate(ctx context.Context) error {
 		CHECK (sender_id <> recipient_id)
 	);
 	CREATE INDEX IF NOT EXISTS direct_messages_pair_idx ON direct_messages (LEAST(sender_id, recipient_id), GREATEST(sender_id, recipient_id), id DESC);
-	CREATE INDEX IF NOT EXISTS direct_messages_unread_idx ON direct_messages (recipient_id, sender_id) WHERE read_at IS NULL;`)
+	CREATE INDEX IF NOT EXISTS direct_messages_unread_idx ON direct_messages (recipient_id, sender_id) WHERE read_at IS NULL;
+	ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS attachment_name TEXT,
+		ADD COLUMN IF NOT EXISTS attachment_type TEXT,
+		ADD COLUMN IF NOT EXISTS attachment_width INT,
+		ADD COLUMN IF NOT EXISTS attachment_height INT,
+		ADD COLUMN IF NOT EXISTS attachment_original_name TEXT,
+		ADD COLUMN IF NOT EXISTS attachment_size BIGINT;
+	DO $$ BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='direct_messages_content_check') THEN
+			ALTER TABLE direct_messages DROP CONSTRAINT IF EXISTS direct_messages_body_check;
+			ALTER TABLE direct_messages ADD CONSTRAINT direct_messages_content_check CHECK (
+				char_length(body) <= 4000 AND (char_length(body) > 0 OR attachment_name IS NOT NULL));
+		END IF;
+	END $$;`)
 	return err
 }
 
-const columns = `id,sender_id,recipient_id,body,created_at,read_at`
+const columns = `id,sender_id,recipient_id,body,created_at,read_at,attachment_name,attachment_type,attachment_width,attachment_height,attachment_original_name,attachment_size`
 
 func scanInto(row interface{ Scan(...any) error }, m *Message, extra ...any) error {
 	var readAt sql.NullTime
-	dest := append([]any{&m.ID, &m.SenderID, &m.RecipientID, &m.Body, &m.CreatedAt, &readAt}, extra...)
+	var name, contentType, original sql.NullString
+	var width, height, size sql.NullInt64
+	dest := append([]any{&m.ID, &m.SenderID, &m.RecipientID, &m.Body, &m.CreatedAt, &readAt, &name, &contentType, &width, &height, &original, &size}, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return err
 	}
 	if readAt.Valid {
 		v := readAt.Time
 		m.ReadAt = &v
+	}
+	if name.Valid {
+		a := &Attachment{FileName: name.String, Kind: "file", ContentType: contentType.String, Name: original.String, Size: size.Int64, Width: int(width.Int64), Height: int(height.Int64), URL: "/api/messages/" + strconv.FormatInt(m.ID, 10) + "/attachment"}
+		if strings.HasPrefix(a.ContentType, "image/") {
+			a.Kind = "image"
+		}
+		if a.Name == "" { // images sent before original names were stored
+			a.Name = "imagem-" + strconv.FormatInt(m.ID, 10) + path.Ext(a.FileName)
+		}
+		m.Attachment = a
 	}
 	return nil
 }
@@ -81,16 +131,36 @@ func NormalizeBody(body string) (string, error) {
 
 // Send stores a text message from sender to an active recipient.
 func (s Store) Send(ctx context.Context, senderID, recipientID, body string) (Message, error) {
-	body, err := NormalizeBody(body)
-	if err != nil {
-		return Message{}, err
+	return s.SendWithAttachment(ctx, senderID, recipientID, body, nil)
+}
+
+// SendWithAttachment stores a message that may carry an image or document;
+// with an attachment the body is an optional caption.
+func (s Store) SendWithAttachment(ctx context.Context, senderID, recipientID, body string, a *Attachment) (Message, error) {
+	var err error
+	if a == nil || strings.TrimSpace(body) != "" {
+		if body, err = NormalizeBody(body); err != nil {
+			return Message{}, err
+		}
+	} else {
+		body = ""
 	}
 	if senderID == recipientID {
 		return Message{}, ErrRecipient
 	}
-	m, err := scan(s.DB.QueryRowContext(ctx, `INSERT INTO direct_messages (sender_id,recipient_id,body)
-		SELECT $1,id,$3 FROM users WHERE id=$2 AND account_status='active'
-		RETURNING `+columns, senderID, recipientID, body))
+	var name, contentType, original sql.NullString
+	var width, height, size sql.NullInt64
+	if a != nil {
+		if !a.valid() {
+			return Message{}, ErrInvalid
+		}
+		name, contentType, original = sql.NullString{String: a.FileName, Valid: true}, sql.NullString{String: a.ContentType, Valid: true}, sql.NullString{String: a.Name, Valid: true}
+		size = sql.NullInt64{Int64: a.Size, Valid: true}
+		width, height = sql.NullInt64{Int64: int64(a.Width), Valid: a.Width > 0}, sql.NullInt64{Int64: int64(a.Height), Valid: a.Height > 0}
+	}
+	m, err := scan(s.DB.QueryRowContext(ctx, `INSERT INTO direct_messages (sender_id,recipient_id,body,attachment_name,attachment_type,attachment_width,attachment_height,attachment_original_name,attachment_size)
+		SELECT $1,id,$3,$4,$5,$6,$7,$8,$9 FROM users WHERE id=$2 AND account_status='active'
+		RETURNING `+columns, senderID, recipientID, body, name, contentType, width, height, original, size))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, ErrRecipient
 	}
@@ -132,6 +202,18 @@ func (s Store) History(ctx context.Context, userID, contactID string, before int
 	return list, rows.Err()
 }
 
+// Attachment returns a message's image if the user took part in the conversation.
+func (s Store) Attachment(ctx context.Context, userID string, messageID int64) (Attachment, error) {
+	m, err := scan(s.DB.QueryRowContext(ctx, `SELECT `+columns+` FROM direct_messages WHERE id=$1 AND (sender_id=$2 OR recipient_id=$2)`, messageID, userID))
+	if err != nil {
+		return Attachment{}, err
+	}
+	if m.Attachment == nil {
+		return Attachment{}, sql.ErrNoRows
+	}
+	return *m.Attachment, nil
+}
+
 // MarkRead marks every unread message from contact to user as read and
 // returns the read timestamp and how many messages changed.
 func (s Store) MarkRead(ctx context.Context, userID, contactID string) (time.Time, int64, error) {
@@ -147,7 +229,8 @@ func (s Store) MarkRead(ctx context.Context, userID, contactID string) (time.Tim
 // Conversations returns the latest message and unread count for each
 // active contact the user has exchanged messages with.
 func (s Store) Conversations(ctx context.Context, userID string) ([]Conversation, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT ON (mine.other) mine.id,mine.sender_id,mine.recipient_id,mine.body,mine.created_at,mine.read_at,mine.other,
+	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT ON (mine.other) mine.id,mine.sender_id,mine.recipient_id,mine.body,mine.created_at,mine.read_at,
+		mine.attachment_name,mine.attachment_type,mine.attachment_width,mine.attachment_height,mine.attachment_original_name,mine.attachment_size,mine.other,
 		(SELECT COUNT(*) FROM direct_messages u WHERE u.recipient_id=$1 AND u.sender_id=mine.other AND u.read_at IS NULL)
 		FROM (SELECT m.*, CASE WHEN m.sender_id=$1 THEN m.recipient_id ELSE m.sender_id END AS other
 			FROM direct_messages m WHERE m.sender_id=$1 OR m.recipient_id=$1) mine
