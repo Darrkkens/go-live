@@ -43,3 +43,11 @@ func TestHubEmitAndDisconnect(t *testing.T) {
 		t.Fatal("last connection of a not detected")
 	}
 }
+
+func TestEndStatus(t *testing.T) {
+	ringing := &activeCall{callInfo: callInfo{CallerID: "a", CalleeID: "b", Status: "ringing"}}
+	active := &activeCall{callInfo: callInfo{CallerID: "a", CalleeID: "b", Status: "active"}}
+	if endStatus(ringing, "a") != "cancelled" || endStatus(ringing, "b") != "declined" || endStatus(active, "a") != "ended" || endStatus(active, "b") != "ended" {
+		t.Fatal("unexpected end status")
+	}
+}

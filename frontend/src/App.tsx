@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent, type KeyboardEvent } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent, type KeyboardEvent } from 'react'
 import './App.css'
+import { callIcons, callSummary, type CallInfo, type CallJoin, type CallRecord } from './callUtils'
 
 type User = {
   id: string
@@ -15,13 +16,17 @@ type Toast = { kind: 'success' | 'error'; message: string }
 type Contact = Pick<User, 'id' | 'avatar' | 'username' | 'userTag' | 'status'>
 type Panel = 'chat' | 'profile' | 'admin'
 type Attachment = { kind: 'image' | 'file'; url: string; contentType: string; name: string; size: number; width?: number; height?: number }
-type Message = { id: number; senderId: string; recipientId: string; body: string; attachment: Attachment | null; createdAt: string; readAt: string | null; editedAt: string | null; deletedAt: string | null }
+type Message = { id: number; senderId: string; recipientId: string; body: string; attachment: Attachment | null; createdAt: string; readAt: string | null; editedAt: string | null; deletedAt: string | null; call: CallRecord | null }
 type PendingAttachment = { contactId: string; file: File; kind: 'image' | 'file'; preview: string | null }
 type Conversation = { contactId: string; lastMessage: Message; unread: number }
 type Thread = { messages: Message[]; hasMore: boolean; loaded: boolean }
-type RealtimeEvent = { type: 'message' | 'message_updated'; message: Message } | { type: 'read'; readerId: string; readAt: string } | { type: 'presence'; userId: string; status: User['status'] }
+type RealtimeEvent = { type: 'message' | 'message_updated'; message: Message } | { type: 'read'; readerId: string; readAt: string } | { type: 'presence'; userId: string; status: User['status'] } | { type: 'call'; call: CallInfo }
 
 const apiBase = `http://localhost:${import.meta.env.VITE_PORT || '8081'}`
+// The LiveKit client is large, so the call UI loads on first use.
+const CallScreen = lazy(() => import('./calls').then((m) => ({ default: m.CallScreen })))
+const IncomingCall = lazy(() => import('./calls').then((m) => ({ default: m.IncomingCall })))
+
 const realtimeUrl = `${apiBase.replace(/^http/, 'ws')}/api/ws`
 const pageSize = 50
 const maxMessageLength = 4000
@@ -70,6 +75,10 @@ function FileIcon() {
 function MenuIcon({ path }: { path: string }) {
   return <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d={path} /></svg>
 }
+function CallIcon({ path, size = 18 }: { path: string; size?: number }) {
+  return <svg viewBox="0 0 24 24" width={size} height={size} aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d={path} /></svg>
+}
+
 const iconPaths = {
   chevron: 'm6 9 6 6 6-6',
   edit: 'M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4ZM13.5 6.5l4 4',
@@ -94,8 +103,9 @@ function fileFromClipboard(data: DataTransfer | null) {
   return data.files[0] ?? [...data.items].find((i) => i.kind === 'file')?.getAsFile() ?? undefined
 }
 
-function previewText(m: Message) {
+function previewText(m: Message, me?: string) {
   if (m.deletedAt) return 'Mensagem apagada'
+  if (m.call) return callSummary(m.call, m.senderId === me).preview
   if (!m.attachment || m.body) return m.body
   return m.attachment.kind === 'image' ? 'Foto' : m.attachment.name
 }
@@ -217,6 +227,13 @@ function App() {
   const [confirmDelete, setConfirmDelete] = useState<Message | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [now, setNow] = useState(() => Date.now())
+  const [activeCall, setActiveCall] = useState<(CallJoin & { startVideo: boolean }) | null>(null)
+  const [incomingCall, setIncomingCall] = useState<CallInfo | null>(null)
+  const [callBusy, setCallBusy] = useState(false)
+  const [callDockEl, setCallDockEl] = useState<HTMLDivElement | null>(null)
+  const [callMiniEl, setCallMiniEl] = useState<HTMLDivElement | null>(null)
+  const activeCallRef = useRef<string | null>(null)
+  useLayoutEffect(() => { activeCallRef.current = activeCall?.call.id ?? null })
   const deleteCancelRef = useRef<HTMLButtonElement>(null)
   const dragDepth = useRef(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -229,9 +246,11 @@ function App() {
   const stickToBottom = useRef(true)
   const olderAnchor = useRef<number | null>(null)
   const userIdRef = useRef<string | null>(null)
+  const contactsRef = useRef<Contact[]>([])
   const selectedRef = useRef<string | null>(null)
   useLayoutEffect(() => {
     userIdRef.current = user?.id ?? null
+    contactsRef.current = contacts
     selectedRef.current = panel === 'chat' ? selectedContactId : null
   })
 
@@ -296,12 +315,39 @@ function App() {
       const removedUnread = message.deletedAt && message.senderId === contactId && !message.readAt && current.unread > 0
       return { ...all, [contactId]: { ...current, lastMessage, unread: current.unread - (removedUnread ? 1 : 0) } }
     })
+    if (message.call && message.call.status !== 'ringing' && message.call.status !== 'active' && message.senderId !== me) loadConversations()
     if (message.deletedAt) {
       setLightbox((current) => current?.id === message.id ? null : current)
       setEditing((current) => current?.message.id === message.id ? null : current)
       setConfirmDelete((current) => current?.id === message.id ? null : current)
     }
-  }, [])
+  }, [loadConversations])
+
+  const contactName = useCallback((id: string) => contactsRef.current.find((c) => c.id === id)?.username ?? 'O contato', [])
+
+  const handleCallEvent = useCallback((call: CallInfo) => {
+    const me = userIdRef.current
+    if (!me) return
+    const mine = activeCallRef.current === call.id
+    if (call.status === 'ringing') {
+      if (call.calleeId === me && !activeCallRef.current) setIncomingCall(call)
+      return
+    }
+    // Answered in another tab, or finished: stop ringing here.
+    setIncomingCall((current) => current?.id === call.id ? null : current)
+    if (call.status === 'active') {
+      if (mine) setActiveCall((current) => current ? { ...current, call } : current)
+      return
+    }
+    if (mine) {
+      setActiveCall(null)
+      const name = contactName(call.callerId === me ? call.calleeId : call.callerId)
+      if (call.callerId === me && call.status === 'declined') notify('error', `${name} recusou a ligação.`)
+      else if (call.callerId === me && call.status === 'missed') notify('error', `${name} não atendeu.`)
+      else if (call.status === 'ended') notify('success', 'Ligação encerrada.')
+      else if (call.calleeId === me && call.status === 'cancelled') notify('success', `${name} desligou.`)
+    }
+  }, [contactName])
 
   const receive = useCallback((message: Message) => {
     const me = userIdRef.current
@@ -311,7 +357,7 @@ function App() {
     setConversations((all) => {
       const current = all[contactId]
       if (current && current.lastMessage.id >= message.id) return all
-      const isNewIncoming = message.senderId === contactId && !message.readAt
+      const isNewIncoming = message.senderId === contactId && !message.readAt && (!message.call || message.call.status === 'missed')
       return { ...all, [contactId]: { contactId, lastMessage: message, unread: (current?.unread ?? 0) + (isNewIncoming ? 1 : 0) } }
     })
   }, [])
@@ -339,6 +385,7 @@ function App() {
         try { data = JSON.parse(event.data) } catch { return }
         if (data.type === 'message') receive(data.message)
         if (data.type === 'message_updated') applyUpdate(data.message)
+        if (data.type === 'call') handleCallEvent(data.call)
         if (data.type === 'presence') {
           const { userId, status } = data
           setContacts((list) => list.map((contact) => contact.id === userId ? { ...contact, status } : contact))
@@ -358,7 +405,7 @@ function App() {
     }
     connect()
     return () => { stopped = true; window.clearTimeout(timer); socket?.close() }
-  }, [user?.id, loadConversations, loadThread, receive, applyUpdate])
+  }, [user?.id, loadConversations, loadThread, receive, applyUpdate, handleCallEvent])
 
   useEffect(() => {
     const onVisibility = () => setVisible(document.visibilityState === 'visible')
@@ -474,6 +521,61 @@ function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [lightbox])
+
+  useEffect(() => {
+    if (!user?.id) return
+    request<CallJoin | { call: null }>('/api/calls/current').then((res) => {
+      if (!res.call) return
+      if ('token' in res && res.token) setActiveCall({ ...(res as CallJoin), startVideo: false })
+      else if (res.call.status === 'ringing' && res.call.calleeId === user.id) setIncomingCall(res.call)
+    }).catch(() => {})
+  }, [user?.id])
+
+  // Warm up the call UI so an incoming call shows without delay.
+  useEffect(() => {
+    if (!user?.id) return
+    const timer = window.setTimeout(() => { void import('./calls') }, 2000)
+    return () => window.clearTimeout(timer)
+  }, [user?.id])
+
+  async function startCall(media: 'audio' | 'video') {
+    if (!selectedContactId || callBusy) return
+    if (activeCall) { notify('error', 'Você já está em uma ligação.'); return }
+    setCallBusy(true)
+    try {
+      const res = await request<CallJoin & { unavailable?: string; message?: string }>('/api/calls', { method: 'POST', body: JSON.stringify({ contactId: selectedContactId, media }) })
+      if (res.unavailable) notify('error', res.message ?? 'O contato não está disponível.')
+      else setActiveCall({ ...res, startVideo: media === 'video' })
+    } catch (err) { notify('error', (err as Error).message) }
+    finally { setCallBusy(false) }
+  }
+
+  async function acceptCall(video: boolean) {
+    if (!incomingCall || callBusy) return
+    setCallBusy(true)
+    try {
+      const res = await request<CallJoin>(`/api/calls/${incomingCall.id}/accept`, { method: 'POST' })
+      setIncomingCall(null)
+      setActiveCall({ ...res, startVideo: video })
+      // Like answering on Discord: open the conversation where the call lives.
+      setSelectedContactId(res.call.callerId); setPanel('chat')
+    } catch (err) { setIncomingCall(null); notify('error', (err as Error).message) }
+    finally { setCallBusy(false) }
+  }
+
+  async function declineCall() {
+    if (!incomingCall) return
+    const id = incomingCall.id
+    setIncomingCall(null)
+    await request<void>(`/api/calls/${id}/decline`, { method: 'POST' }).catch(() => {})
+  }
+
+  async function endCall() {
+    if (!activeCall) return
+    const id = activeCall.call.id
+    setActiveCall(null)
+    await request<void>(`/api/calls/${id}/end`, { method: 'POST' }).catch(() => {})
+  }
 
   function startEdit(message: Message) {
     if (!selectedContactId) return
@@ -593,7 +695,7 @@ function App() {
 
   function clearSession() {
     setUser(null); setUsers([]); setContacts([]); setSelectedContactId(null); setPanel('chat')
-    setConversations({}); setThreads({}); setDrafts({}); discardPending(); setLightbox(null); setEditing(null); setMenu(null); setConfirmDelete(null)
+    setConversations({}); setThreads({}); setDrafts({}); discardPending(); setLightbox(null); setEditing(null); setMenu(null); setConfirmDelete(null); setActiveCall(null); setIncomingCall(null)
   }
 
   useLayoutEffect(() => {
@@ -740,13 +842,14 @@ function App() {
                   <span className="contact-text">
                     <span className="contact-line"><strong>{contact.username}</strong>{conversations[contact.id] && <time className="contact-time" dateTime={conversations[contact.id].lastMessage.createdAt}>{previewTime(conversations[contact.id].lastMessage.createdAt)}</time>}</span>
                     <span className="contact-line">
-                      <small className="contact-preview">{conversations[contact.id]?.lastMessage.senderId === user.id && !conversations[contact.id].lastMessage.deletedAt && <ReadTicks message={conversations[contact.id].lastMessage} />}{conversations[contact.id] ? <>{conversations[contact.id].lastMessage.senderId === user.id && 'Você: '}{conversations[contact.id].lastMessage.attachment && (conversations[contact.id].lastMessage.attachment!.kind === 'image' ? <PhotoIcon /> : <FileIcon />)}{previewText(conversations[contact.id].lastMessage)}</> : `@${contact.userTag}`}</small>
+                      <small className="contact-preview">{conversations[contact.id]?.lastMessage.senderId === user.id && !conversations[contact.id].lastMessage.deletedAt && !conversations[contact.id].lastMessage.call && <ReadTicks message={conversations[contact.id].lastMessage} />}{conversations[contact.id] ? <>{conversations[contact.id].lastMessage.senderId === user.id && !conversations[contact.id].lastMessage.call && 'Você: '}{conversations[contact.id].lastMessage.call && <span className={`preview-call ${callSummary(conversations[contact.id].lastMessage.call!, conversations[contact.id].lastMessage.senderId === user.id).missed ? 'missed' : ''}`}><CallIcon path={conversations[contact.id].lastMessage.call!.media === 'video' ? callIcons.video : callIcons.phone} size={15} /></span>}{conversations[contact.id].lastMessage.attachment && (conversations[contact.id].lastMessage.attachment!.kind === 'image' ? <PhotoIcon /> : <FileIcon />)}{previewText(conversations[contact.id].lastMessage, user.id)}</> : `@${contact.userTag}`}</small>
                       {conversations[contact.id]?.unread ? <span className="unread-badge" aria-label={`${conversations[contact.id].unread} não lidas`}>{conversations[contact.id].unread > 99 ? '99+' : conversations[contact.id].unread}</span> : <span className={`presence-dot ${contact.status}`} aria-label={contact.status} />}
                     </span>
                   </span>
                 </button>
               )) : <p className="sidebar-empty">{search ? 'Nenhum contato encontrado.' : 'Ainda não há outros usuários ativos.'}</p>}
             </div>
+            <div ref={setCallMiniEl} />
             <div className="sidebar-footer">
               <button className="account-shortcut" type="button" onClick={() => setPanel('profile')}>
                 <span className="small-avatar-wrap">{user.avatar ? <img className="small-avatar" src={avatarSource(user.avatar)} alt="" /> : <span className="small-avatar contact-placeholder">{user.username.slice(0, 1).toUpperCase()}</span>}<span className={`own-presence ${status}`} aria-label={`Seu status: ${status}`} /></span>
@@ -769,9 +872,11 @@ function App() {
                       {selectedContact.avatar ? <img className="header-avatar" src={avatarSource(selectedContact.avatar)} alt="" /> : <span className="header-avatar contact-placeholder">{selectedContact.username.slice(0, 1).toUpperCase()}</span>}
                       <div className="conversation-identity"><strong>{selectedContact.username}</strong><small>{connected ? <>@{selectedContact.userTag} · {selectedContact.status === 'online' ? 'online' : selectedContact.status === 'busy' ? 'ocupado' : selectedContact.status === 'away' ? 'ausente' : 'offline'}</> : 'Reconectando…'}</small></div>
                       <button className="icon-button header-action" type="button" onClick={() => notify('success', 'Busca de mensagens chega na próxima etapa.')} aria-label="Buscar mensagens" title="Buscar mensagens"><img src="/figma-chat/search-header.svg" alt="" /></button>
-                      <button className="icon-button header-action" type="button" onClick={() => notify('success', 'Chamadas de voz chegam em uma próxima etapa.')} aria-label="Iniciar chamada" title="Chamada em breve"><img src="/figma-chat/call.svg" alt="" /></button>
+                      <button className="icon-button header-action" type="button" onClick={() => startCall('audio')} disabled={callBusy || !!activeCall} aria-label={`Ligar para ${selectedContact.username}`} title="Chamada de voz"><img src="/figma-chat/call.svg" alt="" /></button>
+                      <button className="icon-button header-action video-action" type="button" onClick={() => startCall('video')} disabled={callBusy || !!activeCall} aria-label={`Chamada de vídeo com ${selectedContact.username}`} title="Chamada de vídeo"><CallIcon path={callIcons.video} size={22} /></button>
                       <button className="icon-button header-action" type="button" onClick={() => setPanel('profile')} aria-label="Mais opções" title="Mais opções"><img src="/figma-chat/more.svg" alt="" /></button>
                     </header>
+                    {activeCall && [activeCall.call.callerId, activeCall.call.calleeId].includes(selectedContact.id) && <div className="call-dock" ref={setCallDockEl} />}
                     <div className="conversation-canvas" ref={canvasRef} onScroll={(e) => { const el = e.currentTarget; stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80 }}>
                       {!openThread?.loaded ? <p className="thread-status">Carregando mensagens…</p> : !openThread.messages.length ? (
                         <div className="empty-conversation"><span className="empty-mark">✦</span><h1>Conversa com {selectedContact.username}</h1><p>Nenhuma mensagem ainda. Diga olá!</p></div>
@@ -786,7 +891,16 @@ function App() {
                               <li key={m.id} className="message-row-wrap">
                                 {newDay && <div className="day-separator"><span>{dayLabel(m.createdAt)}</span></div>}
                                 <div className={`message-row ${mine ? 'mine' : 'theirs'} ${previous && previous.senderId === m.senderId && !newDay ? 'grouped' : ''} ${menu?.id === m.id ? 'menu-open' : ''} ${editing?.message.id === m.id ? 'being-edited' : ''}`}>
-                                  {m.deletedAt ? (
+                                  {m.call ? (() => {
+                                    const summary = callSummary(m.call, mine)
+                                    return (
+                                      <div className={`bubble call-bubble ${summary.missed ? 'missed' : ''}`}>
+                                        <span className="call-bubble-icon"><CallIcon path={summary.missed ? callIcons.missed : m.call.media === 'video' ? callIcons.video : callIcons.phone} size={20} /></span>
+                                        <span className="call-bubble-text"><strong>{summary.missed ? (m.call.media === 'video' ? 'Chamada de vídeo perdida' : 'Chamada de voz perdida') : summary.kind}</strong><small>{summary.missed ? timeFormat.format(new Date(m.createdAt)) : `${summary.detail} · ${timeFormat.format(new Date(m.createdAt))}`}</small></span>
+                                        {m.call.status !== 'ringing' && m.call.status !== 'active' && <button type="button" className="call-bubble-again" onClick={() => startCall(m.call!.media)} disabled={callBusy || !!activeCall} aria-label="Ligar de novo" title="Ligar de novo"><CallIcon path={m.call.media === 'video' ? callIcons.video : callIcons.phone} /></button>}
+                                      </div>
+                                    )
+                                  })() : m.deletedAt ? (
                                     <div className="bubble deleted">
                                       <p><MenuIcon path={iconPaths.ban} />{mine ? 'Você apagou esta mensagem' : 'Mensagem apagada'}</p>
                                       <span className="bubble-meta"><time dateTime={m.createdAt}>{timeFormat.format(new Date(m.createdAt))}</time></span>
@@ -863,7 +977,7 @@ function App() {
                     {dropActive && <div className="drop-overlay" aria-hidden="true"><div><strong>Solte o arquivo aqui</strong><span>Imagens até 10 MB · PDF, documentos e compactados até 25 MB</span></div></div>}
                   </>
                 ) : (
-                  <div className="welcome-view"><img src="/go-live-icon.png" alt="" /><h1>GO LIVE</h1><p>Selecione um contato para abrir a conversa.</p><span>Voz e compartilhamento de tela serão adicionados nas próximas etapas.</span></div>
+                  <div className="welcome-view"><img src="/go-live-icon.png" alt="" /><h1>GO LIVE</h1><p>Selecione um contato para abrir a conversa.</p><span>Mensagens, arquivos, chamadas de voz e vídeo e compartilhamento de tela.</span></div>
                 )}
               </>
             ) : (
@@ -964,6 +1078,19 @@ function App() {
           </section>
         </>
       )}
+      <Suspense fallback={null}>
+      {user && incomingCall && !activeCall && (() => {
+        const peer = contacts.find((c) => c.id === incomingCall.callerId)
+        return <IncomingCall call={incomingCall} peer={{ username: peer?.username ?? 'Contato', avatar: peer?.avatar ? avatarSource(peer.avatar) : '' }} onAccept={acceptCall} onDecline={declineCall} busy={callBusy} />
+      })()}
+      {user && activeCall && (() => {
+        const peerId = activeCall.call.callerId === user.id ? activeCall.call.calleeId : activeCall.call.callerId
+        const peer = contacts.find((c) => c.id === peerId)
+        const docked = panel === 'chat' && selectedContactId === peerId
+        return <CallScreen key={activeCall.call.id} join={activeCall} me={{ id: user.id, username: user.username, avatar: user.avatar ? avatarSource(user.avatar) : '' }} peer={{ id: peerId, username: peer?.username ?? 'Contato', avatar: peer?.avatar ? avatarSource(peer.avatar) : '' }} startVideo={activeCall.startVideo}
+          docked={docked} dockEl={callDockEl} miniEl={callMiniEl} onOpen={() => { setSelectedContactId(peerId); setPanel('chat') }} onEnd={endCall} notify={notify} />
+      })()}
+      </Suspense>
       {confirmDelete && (
         <div className="app-modal-backdrop" onClick={(e) => { if (e.target === e.currentTarget && !deleting) setConfirmDelete(null) }}>
           <div className="app-modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-title" aria-describedby="delete-desc">

@@ -45,6 +45,11 @@ func (s *Server) RegisterRoutes() http.Handler {
 	r.GET("/api/messages/:id/attachment", s.getAttachment)
 	r.PATCH("/api/messages/:id", s.editMessage)
 	r.DELETE("/api/messages/:id", s.deleteMessage)
+	r.GET("/api/calls/current", s.currentCall)
+	r.POST("/api/calls", s.startCall)
+	r.POST("/api/calls/:id/accept", s.acceptCall)
+	r.POST("/api/calls/:id/decline", s.declineCall)
+	r.POST("/api/calls/:id/end", s.endCall)
 	r.GET("/api/ws", s.realtime)
 
 	return r

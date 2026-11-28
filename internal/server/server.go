@@ -13,6 +13,7 @@ import (
 
 	"github.com/Darrkkens/go-live/internal/accounts"
 	"github.com/Darrkkens/go-live/internal/database"
+	"github.com/Darrkkens/go-live/internal/livekit"
 	"github.com/Darrkkens/go-live/internal/messages"
 )
 
@@ -23,6 +24,8 @@ type Server struct {
 	accounts accounts.Store
 	messages messages.Store
 	hub      *hub
+	calls    *callManager
+	livekit  livekit.Config
 }
 
 func NewServer() *http.Server {
@@ -35,6 +38,11 @@ func NewServer() *http.Server {
 	NewServer.accounts = accounts.Store{DB: NewServer.db.DB()}
 	NewServer.messages = messages.Store{DB: NewServer.db.DB()}
 	NewServer.hub = newHub()
+	NewServer.calls = newCallManager()
+	NewServer.livekit = livekit.FromEnv()
+	if !NewServer.livekit.Enabled() {
+		log.Printf("LIVEKIT_API_KEY/LIVEKIT_API_SECRET not set (secret needs 32+ characters): calls are disabled")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := NewServer.accounts.Migrate(ctx); err != nil {
