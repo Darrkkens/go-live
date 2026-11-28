@@ -51,6 +51,7 @@ type videoGrant struct {
 	Room              string   `json:"room,omitempty"`
 	RoomJoin          bool     `json:"roomJoin,omitempty"`
 	RoomCreate        bool     `json:"roomCreate,omitempty"`
+	RoomAdmin         bool     `json:"roomAdmin,omitempty"`
 	CanPublish        *bool    `json:"canPublish,omitempty"`
 	CanSubscribe      *bool    `json:"canSubscribe,omitempty"`
 	CanPublishData    *bool    `json:"canPublishData,omitempty"`
@@ -79,33 +80,74 @@ func (c Config) sign(cl claims) (string, error) {
 	return unsigned + "." + enc.EncodeToString(mac.Sum(nil)), nil
 }
 
+// Sources a participant may publish.
+const (
+	SourceMicrophone       = "microphone"
+	SourceCamera           = "camera"
+	SourceScreenShare      = "screen_share"
+	SourceScreenShareAudio = "screen_share_audio"
+)
+
+// AllSources lets a participant publish microphone, camera and screen.
+var AllSources = []string{SourceMicrophone, SourceCamera, SourceScreenShare, SourceScreenShareAudio}
+
 // JoinToken lets one user join one room and publish microphone, camera and screen.
 func (c Config) JoinToken(room, identity, name string, ttl time.Duration) (string, error) {
+	return c.JoinTokenWith(room, identity, name, ttl, AllSources)
+}
+
+// JoinTokenWith lets one user join one room and publish only the given sources.
+func (c Config) JoinTokenWith(room, identity, name string, ttl time.Duration, sources []string) (string, error) {
 	if !c.Enabled() {
 		return "", errors.New("livekit is not configured")
 	}
-	yes, no := true, false
+	publish, yes, no := len(sources) > 0, true, false
 	now := time.Now()
+	grant := videoGrant{Room: room, RoomJoin: true, CanPublish: &publish, CanSubscribe: &yes, CanPublishData: &no}
+	if publish {
+		grant.CanPublishSources = sources
+	}
 	return c.sign(claims{
 		Issuer: c.APIKey, Subject: identity, Name: name,
 		NotBefore: now.Add(-10 * time.Second).Unix(), ExpiresAt: now.Add(ttl).Unix(),
-		Video: videoGrant{Room: room, RoomJoin: true, CanPublish: &yes, CanSubscribe: &yes, CanPublishData: &no,
-			CanPublishSources: []string{"microphone", "camera", "screen_share", "screen_share_audio"}},
+		Video: grant,
+	})
+}
+
+// UpdatePermissions changes what a connected participant may publish. LiveKit
+// unpublishes tracks that are no longer allowed (e.g. the microphone of someone muted by a moderator).
+func (c Config) UpdatePermissions(ctx context.Context, room, identity string, sources []string) error {
+	upper := make([]string, 0, len(sources))
+	for _, s := range sources {
+		upper = append(upper, strings.ToUpper(s))
+	}
+	return c.roomService(ctx, "UpdateParticipant", room, map[string]any{
+		"room": room, "identity": identity,
+		"permission": map[string]any{"canSubscribe": true, "canPublish": len(sources) > 0, "canPublishData": false, "canPublishSources": upper},
 	})
 }
 
 // DeleteRoom disconnects everyone from a room. A missing room is not an error.
 func (c Config) DeleteRoom(ctx context.Context, room string) error {
+	return c.roomService(ctx, "DeleteRoom", room, map[string]any{"room": room})
+}
+
+// RemoveParticipant disconnects one user from a room. A missing room or user is not an error.
+func (c Config) RemoveParticipant(ctx context.Context, room, identity string) error {
+	return c.roomService(ctx, "RemoveParticipant", room, map[string]any{"room": room, "identity": identity})
+}
+
+func (c Config) roomService(ctx context.Context, method, room string, body map[string]any) error {
 	if !c.Enabled() {
 		return nil
 	}
 	now := time.Now()
-	token, err := c.sign(claims{Issuer: c.APIKey, NotBefore: now.Add(-10 * time.Second).Unix(), ExpiresAt: now.Add(time.Minute).Unix(), Video: videoGrant{RoomCreate: true}})
+	token, err := c.sign(claims{Issuer: c.APIKey, NotBefore: now.Add(-10 * time.Second).Unix(), ExpiresAt: now.Add(time.Minute).Unix(), Video: videoGrant{Room: room, RoomAdmin: true, RoomCreate: true}})
 	if err != nil {
 		return err
 	}
-	payload, _ := json.Marshal(map[string]string{"room": room})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.APIURL, "/")+"/twirp/livekit.RoomService/DeleteRoom", bytes.NewReader(payload))
+	payload, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.APIURL, "/")+"/twirp/livekit.RoomService/"+method, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -119,5 +161,5 @@ func (c Config) DeleteRoom(ctx context.Context, room string) error {
 	if res.StatusCode == http.StatusNotFound || res.StatusCode < 300 {
 		return nil
 	}
-	return fmt.Errorf("livekit DeleteRoom: HTTP %d", res.StatusCode)
+	return fmt.Errorf("livekit %s: HTTP %d", method, res.StatusCode)
 }

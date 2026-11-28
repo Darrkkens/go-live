@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"database/sql"
 	"errors"
 	"image"
 	"image/gif"
@@ -19,6 +18,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/Darrkkens/go-live/internal/guilds"
 	"github.com/Darrkkens/go-live/internal/messages"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -172,6 +172,34 @@ func (s *Server) sendAttachment(c *gin.Context) {
 	if !ok {
 		return
 	}
+	s.uploadAndSend(c, func(caption string, a *messages.Attachment) (messages.Message, error) {
+		return s.messages.SendWithAttachment(c.Request.Context(), u.ID, contactID, caption, a)
+	})
+}
+
+func (s *Server) sendChannelAttachment(c *gin.Context) {
+	if !s.sameOrigin(c) {
+		return
+	}
+	u, ok := s.currentUser(c)
+	if !ok {
+		return
+	}
+	ch, access, ok := s.channelForMember(c, u.ID)
+	if !ok {
+		return
+	}
+	if !access.Can(ch.ID, guilds.PermSendMessages|guilds.PermAttachFiles) {
+		forbidden(c, "Você não pode enviar arquivos neste canal.")
+		return
+	}
+	s.uploadAndSend(c, func(caption string, a *messages.Attachment) (messages.Message, error) {
+		return s.messages.SendToChannel(c.Request.Context(), u.ID, ch.ID, caption, a)
+	})
+}
+
+// uploadAndSend validates and stores an uploaded file, then sends it with send.
+func (s *Server) uploadAndSend(c *gin.Context, send func(caption string, a *messages.Attachment) (messages.Message, error)) {
 	// Large photos on slow connections need more than the server's default read timeout.
 	_ = http.NewResponseController(c.Writer).SetReadDeadline(time.Now().Add(2 * time.Minute))
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxFileBytes+(1<<20))
@@ -221,7 +249,7 @@ func (s *Server) sendAttachment(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível salvar o arquivo."})
 		return
 	}
-	m, err := s.messages.SendWithAttachment(c.Request.Context(), u.ID, contactID, caption, &messages.Attachment{FileName: name, ContentType: img.contentType, Name: displayName, Size: int64(len(img.data)), Width: img.width, Height: img.height})
+	m, err := send(caption, &messages.Attachment{FileName: name, ContentType: img.contentType, Name: displayName, Size: int64(len(img.data)), Width: img.width, Height: img.height})
 	if err != nil {
 		_ = os.Remove(path)
 		switch {
@@ -234,7 +262,7 @@ func (s *Server) sendAttachment(c *gin.Context) {
 		}
 		return
 	}
-	s.hub.emit(messageEvent{Type: "message", Message: m}, m.SenderID, m.RecipientID)
+	s.emitMessage("message", m)
 	c.JSON(http.StatusCreated, m)
 }
 
@@ -248,8 +276,8 @@ func (s *Server) getAttachment(c *gin.Context) {
 		c.Status(http.StatusNotFound)
 		return
 	}
-	a, err := s.messages.Attachment(c.Request.Context(), u.ID, id)
-	if errors.Is(err, sql.ErrNoRows) {
+	m, err := s.messages.Get(c.Request.Context(), id)
+	if errors.Is(err, messages.ErrNotFound) || (err == nil && (m.Attachment == nil || !s.canSee(c.Request.Context(), u.ID, m))) {
 		c.Status(http.StatusNotFound)
 		return
 	}
@@ -257,6 +285,7 @@ func (s *Server) getAttachment(c *gin.Context) {
 		c.Status(http.StatusInternalServerError)
 		return
 	}
+	a := *m.Attachment
 	c.Header("X-Content-Type-Options", "nosniff")
 	c.Header("Cache-Control", "private, max-age=86400, immutable")
 	// <img> loads and CORS fetches of the same URL must not share a cache entry.

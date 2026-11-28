@@ -9,6 +9,15 @@
     <meta name="theme-color" content="#07142d" />
     <meta name="description" content="GO LIVE" />
     <title>GO LIVE</title>
+    <script>
+      // Apply the saved theme before the first paint so dark mode does not flash white.
+      try {
+        var t = localStorage.getItem('golive.theme') || 'system'
+        var dark = t === 'dark' || (t === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light'
+        document.documentElement.style.colorScheme = dark ? 'dark' : 'light'
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

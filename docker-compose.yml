@@ -26,7 +26,7 @@ services:
           ${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}
         room:
           empty_timeout: 60
-          max_participants: 2
+          max_participants: 25
     ports:
       - "7880:7880"
       - "7881:7881"

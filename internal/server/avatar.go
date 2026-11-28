@@ -46,31 +46,49 @@ func (s *Server) uploadAvatar(c *gin.Context) {
 	if !ok {
 		return
 	}
+	name, ok := saveUploadedImage(c, "avatar")
+	if !ok {
+		return
+	}
+	updated, err := s.accounts.SetAvatar(c.Request.Context(), u.ID, "/api/avatars/"+name)
+	if err != nil {
+		removeStoredImage("/api/avatars/" + name)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível atualizar o perfil."})
+		return
+	}
+	removeStoredImage(u.Avatar)
+	c.JSON(http.StatusOK, updated)
+}
+
+// saveUploadedImage validates the multipart image in field, re-encodes it
+// (dropping metadata) into the avatar directory and returns its file name.
+// Avatars and server icons share this storage and the /api/avatars/ route.
+func saveUploadedImage(c *gin.Context, field string) (string, bool) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAvatarRequestBytes)
-	file, header, err := c.Request.FormFile("avatar")
+	file, header, err := c.Request.FormFile(field)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Selecione uma imagem PNG ou JPEG de até 4 MB."})
-		return
+		return "", false
 	}
 	defer file.Close()
 	if header.Size > maxAvatarBytes {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "A imagem deve ter até 4 MB."})
-		return
+		return "", false
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxAvatarBytes+1))
 	if err != nil || len(data) > maxAvatarBytes {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "A imagem deve ter até 4 MB."})
-		return
+		return "", false
 	}
 	img, format, err := avatarImage(data)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Envie uma imagem PNG ou JPEG válida de até 2048 × 2048 pixels."})
-		return
+		return "", false
 	}
 	dir := avatarDir()
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível salvar o avatar."})
-		return
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível salvar a imagem."})
+		return "", false
 	}
 	ext := ".jpg"
 	if format == "png" {
@@ -80,8 +98,8 @@ func (s *Server) uploadAvatar(c *gin.Context) {
 	path := filepath.Join(dir, name)
 	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível salvar o avatar."})
-		return
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível salvar a imagem."})
+		return "", false
 	}
 	if format == "png" {
 		err = png.Encode(out, img)
@@ -91,19 +109,17 @@ func (s *Server) uploadAvatar(c *gin.Context) {
 	closeErr := out.Close()
 	if err != nil || closeErr != nil {
 		_ = os.Remove(path)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível salvar o avatar."})
-		return
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível salvar a imagem."})
+		return "", false
 	}
-	updated, err := s.accounts.SetAvatar(c.Request.Context(), u.ID, "/api/avatars/"+name)
-	if err != nil {
-		_ = os.Remove(path)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível atualizar o perfil."})
-		return
+	return name, true
+}
+
+// removeStoredImage deletes a previously uploaded avatar or server icon.
+func removeStoredImage(url string) {
+	if strings.HasPrefix(url, "/api/avatars/") {
+		_ = os.Remove(filepath.Join(avatarDir(), filepath.Base(url)))
 	}
-	if strings.HasPrefix(u.Avatar, "/api/avatars/") {
-		_ = os.Remove(filepath.Join(dir, filepath.Base(u.Avatar)))
-	}
-	c.JSON(http.StatusOK, updated)
 }
 
 func (s *Server) getAvatar(c *gin.Context) {

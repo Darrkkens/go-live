@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Darrkkens/go-live/internal/guilds"
 	"github.com/Darrkkens/go-live/internal/messages"
 	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
@@ -119,7 +120,7 @@ func (s *Server) sendMessage(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível enviar a mensagem."})
 		return
 	}
-	s.hub.emit(messageEvent{Type: "message", Message: m}, m.SenderID, m.RecipientID)
+	s.emitMessage("message", m)
 	c.JSON(http.StatusCreated, m)
 }
 
@@ -163,7 +164,7 @@ func (s *Server) editMessage(c *gin.Context) {
 	case err != nil:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível editar a mensagem."})
 	default:
-		s.hub.emit(messageEvent{Type: "message_updated", Message: m}, m.SenderID, m.RecipientID)
+		s.emitMessage("message_updated", m)
 		c.JSON(http.StatusOK, m)
 	}
 }
@@ -181,6 +182,12 @@ func (s *Server) deleteMessage(c *gin.Context) {
 		return
 	}
 	m, file, err := s.messages.Delete(c.Request.Context(), u.ID, id)
+	// Moderators ("apagar mensagens dos outros") delete any channel message, at any time.
+	if errors.Is(err, messages.ErrExpired) || errors.Is(err, messages.ErrNotFound) {
+		if mod, ok := s.canModerate(c.Request.Context(), u.ID, id); ok {
+			m, file, err = s.messages.DeleteAny(c.Request.Context(), mod)
+		}
+	}
 	if errors.Is(err, messages.ErrExpired) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "O prazo de 5 minutos para apagar esta mensagem terminou."})
 		return
@@ -196,7 +203,7 @@ func (s *Server) deleteMessage(c *gin.Context) {
 	if file != "" {
 		_ = os.Remove(filepath.Join(attachmentDir(), filepath.Base(file)))
 	}
-	s.hub.emit(messageEvent{Type: "message_updated", Message: m}, m.SenderID, m.RecipientID)
+	s.emitMessage("message_updated", m)
 	c.JSON(http.StatusOK, m)
 }
 
@@ -304,4 +311,18 @@ func (s *Server) realtime(c *gin.Context) {
 			}
 		}
 	}
+}
+
+// canModerate reports whether the user may delete someone else's channel message.
+func (s *Server) canModerate(ctx context.Context, userID string, messageID int64) (int64, bool) {
+	m, err := s.messages.Get(ctx, messageID)
+	if err != nil || m.ChannelID == "" || m.DeletedAt != nil || m.Call != nil {
+		return 0, false
+	}
+	ch, err := s.guilds.Channel(ctx, m.ChannelID)
+	if err != nil {
+		return 0, false
+	}
+	a, err := s.guilds.Access(ctx, ch.GuildID, userID)
+	return m.ID, err == nil && a.Can(ch.ID, guilds.PermManageMessages)
 }
