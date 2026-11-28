@@ -31,7 +31,7 @@ const changeWindowSQL = `created_at > NOW() - make_interval(secs => 300)`
 // user's (or is deleted), it is past the window, or otherwise the input was invalid.
 func (s Store) changeError(ctx context.Context, userID string, messageID int64) error {
 	var inWindow bool
-	err := s.DB.QueryRowContext(ctx, `SELECT `+changeWindowSQL+` FROM direct_messages WHERE id=$1 AND sender_id=$2 AND deleted_at IS NULL`, messageID, userID).Scan(&inWindow)
+	err := s.DB.QueryRowContext(ctx, `SELECT `+changeWindowSQL+` FROM direct_messages WHERE id=$1 AND sender_id=$2 AND deleted_at IS NULL AND call_status IS NULL`, messageID, userID).Scan(&inWindow)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return ErrNotFound
@@ -54,7 +54,26 @@ type Message struct {
 	ReadAt      *time.Time  `json:"readAt"`
 	EditedAt    *time.Time  `json:"editedAt"`
 	DeletedAt   *time.Time  `json:"deletedAt"`
+	Call        *CallRecord `json:"call"`
 }
+
+// CallRecord is the history entry of a call, shown in the conversation.
+type CallRecord struct {
+	ID       string `json:"id"`
+	Status   string `json:"status"`
+	Media    string `json:"media"`
+	Duration int    `json:"duration"`
+}
+
+// Call statuses. Ringing and active are live; the rest are final.
+const (
+	CallRinging   = "ringing"
+	CallActive    = "active"
+	CallEnded     = "ended"
+	CallMissed    = "missed"
+	CallDeclined  = "declined"
+	CallCancelled = "cancelled"
+)
 
 // Attachment is an image or document stored on disk; FileName never leaves the server.
 type Attachment struct {
@@ -105,25 +124,34 @@ func (s Store) Migrate(ctx context.Context) error {
 		ADD COLUMN IF NOT EXISTS attachment_original_name TEXT,
 		ADD COLUMN IF NOT EXISTS attachment_size BIGINT,
 		ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ,
-		ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+		ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ,
+		ADD COLUMN IF NOT EXISTS call_id TEXT,
+		ADD COLUMN IF NOT EXISTS call_status TEXT,
+		ADD COLUMN IF NOT EXISTS call_media TEXT,
+		ADD COLUMN IF NOT EXISTS call_duration INT;
 	DO $$ BEGIN
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='direct_messages_content_v2_check') THEN
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='direct_messages_content_v3_check') THEN
 			ALTER TABLE direct_messages DROP CONSTRAINT IF EXISTS direct_messages_body_check;
 			ALTER TABLE direct_messages DROP CONSTRAINT IF EXISTS direct_messages_content_check;
-			ALTER TABLE direct_messages ADD CONSTRAINT direct_messages_content_v2_check CHECK (
-				char_length(body) <= 4000 AND (deleted_at IS NOT NULL OR char_length(body) > 0 OR attachment_name IS NOT NULL));
+			ALTER TABLE direct_messages DROP CONSTRAINT IF EXISTS direct_messages_content_v2_check;
+			ALTER TABLE direct_messages ADD CONSTRAINT direct_messages_content_v3_check CHECK (
+				char_length(body) <= 4000 AND (deleted_at IS NOT NULL OR char_length(body) > 0 OR attachment_name IS NOT NULL OR call_status IS NOT NULL));
 		END IF;
-	END $$;`)
+	END $$;
+	CREATE UNIQUE INDEX IF NOT EXISTS direct_messages_call_idx ON direct_messages (call_id) WHERE call_id IS NOT NULL;
+	-- Calls live in server memory; after a restart unfinished ones are closed.
+	UPDATE direct_messages SET call_status = CASE call_status WHEN 'ringing' THEN 'missed' ELSE 'ended' END
+		WHERE call_status IN ('ringing','active');`)
 	return err
 }
 
-const columns = `id,sender_id,recipient_id,body,created_at,read_at,attachment_name,attachment_type,attachment_width,attachment_height,attachment_original_name,attachment_size,edited_at,deleted_at`
+const columns = `id,sender_id,recipient_id,body,created_at,read_at,attachment_name,attachment_type,attachment_width,attachment_height,attachment_original_name,attachment_size,edited_at,deleted_at,call_id,call_status,call_media,call_duration`
 
 func scanInto(row interface{ Scan(...any) error }, m *Message, extra ...any) error {
 	var readAt, editedAt, deletedAt sql.NullTime
-	var name, contentType, original sql.NullString
-	var width, height, size sql.NullInt64
-	dest := append([]any{&m.ID, &m.SenderID, &m.RecipientID, &m.Body, &m.CreatedAt, &readAt, &name, &contentType, &width, &height, &original, &size, &editedAt, &deletedAt}, extra...)
+	var name, contentType, original, callID, callStatus, callMedia sql.NullString
+	var width, height, size, callDuration sql.NullInt64
+	dest := append([]any{&m.ID, &m.SenderID, &m.RecipientID, &m.Body, &m.CreatedAt, &readAt, &name, &contentType, &width, &height, &original, &size, &editedAt, &deletedAt, &callID, &callStatus, &callMedia, &callDuration}, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return err
 	}
@@ -135,6 +163,9 @@ func scanInto(row interface{ Scan(...any) error }, m *Message, extra ...any) err
 			v := t.src.Time
 			*t.dst = &v
 		}
+	}
+	if callStatus.Valid {
+		m.Call = &CallRecord{ID: callID.String, Status: callStatus.String, Media: callMedia.String, Duration: int(callDuration.Int64)}
 	}
 	if name.Valid {
 		a := &Attachment{FileName: name.String, Kind: "file", ContentType: contentType.String, Name: original.String, Size: size.Int64, Width: int(width.Int64), Height: int(height.Int64), URL: "/api/messages/" + strconv.FormatInt(m.ID, 10) + "/attachment"}
@@ -245,7 +276,7 @@ func (s Store) Edit(ctx context.Context, userID string, messageID int64, body st
 	}
 	m, err := scan(s.DB.QueryRowContext(ctx, `UPDATE direct_messages SET body=$3,
 		edited_at=CASE WHEN body=$3 THEN edited_at ELSE NOW() END
-		WHERE id=$1 AND sender_id=$2 AND deleted_at IS NULL AND ($3<>'' OR attachment_name IS NOT NULL) AND `+changeWindowSQL+`
+		WHERE id=$1 AND sender_id=$2 AND deleted_at IS NULL AND call_status IS NULL AND ($3<>'' OR attachment_name IS NOT NULL) AND `+changeWindowSQL+`
 		RETURNING `+columns, messageID, userID, body))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, s.changeError(ctx, userID, messageID)
@@ -259,13 +290,13 @@ func (s Store) Delete(ctx context.Context, userID string, messageID int64) (Mess
 	var m Message
 	var file sql.NullString
 	err := scanInto(s.DB.QueryRowContext(ctx, `WITH old AS (
-			SELECT id, attachment_name FROM direct_messages WHERE id=$1 AND sender_id=$2 AND deleted_at IS NULL AND `+changeWindowSQL+` FOR UPDATE
+			SELECT id, attachment_name FROM direct_messages WHERE id=$1 AND sender_id=$2 AND deleted_at IS NULL AND call_status IS NULL AND `+changeWindowSQL+` FOR UPDATE
 		)
 		UPDATE direct_messages m SET body='', deleted_at=NOW(), edited_at=NULL, attachment_name=NULL, attachment_type=NULL,
 			attachment_width=NULL, attachment_height=NULL, attachment_original_name=NULL, attachment_size=NULL
 		FROM old WHERE m.id=old.id
 		RETURNING m.id,m.sender_id,m.recipient_id,m.body,m.created_at,m.read_at,m.attachment_name,m.attachment_type,m.attachment_width,
-			m.attachment_height,m.attachment_original_name,m.attachment_size,m.edited_at,m.deleted_at,old.attachment_name`, messageID, userID), &m, &file)
+			m.attachment_height,m.attachment_original_name,m.attachment_size,m.edited_at,m.deleted_at,m.call_id,m.call_status,m.call_media,m.call_duration,old.attachment_name`, messageID, userID), &m, &file)
 	if errors.Is(err, sql.ErrNoRows) {
 		if cause := s.changeError(ctx, userID, messageID); cause != ErrInvalid {
 			return Message{}, "", cause
@@ -273,6 +304,32 @@ func (s Store) Delete(ctx context.Context, userID string, messageID int64) (Mess
 		return Message{}, "", ErrNotFound
 	}
 	return m, file.String, err
+}
+
+// StartCall records a call from caller to an active callee with the given status.
+func (s Store) StartCall(ctx context.Context, callerID, calleeID, callID, media, status string) (Message, error) {
+	if callerID == calleeID {
+		return Message{}, ErrRecipient
+	}
+	if (media != "audio" && media != "video") || (status != CallRinging && status != CallMissed) {
+		return Message{}, ErrInvalid
+	}
+	m, err := scan(s.DB.QueryRowContext(ctx, `INSERT INTO direct_messages (sender_id,recipient_id,body,call_id,call_status,call_media,call_duration)
+		SELECT $1,id,'',$3,$4,$5,0 FROM users WHERE id=$2 AND account_status='active'
+		RETURNING `+columns, callerID, calleeID, callID, status, media))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Message{}, ErrRecipient
+	}
+	return m, err
+}
+
+// UpdateCall changes the status (and duration in seconds) of a recorded call.
+func (s Store) UpdateCall(ctx context.Context, callID, status string, duration int) (Message, error) {
+	m, err := scan(s.DB.QueryRowContext(ctx, `UPDATE direct_messages SET call_status=$2, call_duration=$3 WHERE call_id=$1 RETURNING `+columns, callID, status, duration))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Message{}, ErrNotFound
+	}
+	return m, err
 }
 
 // Attachment returns a message's image if the user took part in the conversation.
@@ -304,8 +361,9 @@ func (s Store) MarkRead(ctx context.Context, userID, contactID string) (time.Tim
 func (s Store) Conversations(ctx context.Context, userID string) ([]Conversation, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT ON (mine.other) mine.id,mine.sender_id,mine.recipient_id,mine.body,mine.created_at,mine.read_at,
 		mine.attachment_name,mine.attachment_type,mine.attachment_width,mine.attachment_height,mine.attachment_original_name,mine.attachment_size,
-		mine.edited_at,mine.deleted_at,mine.other,
-		(SELECT COUNT(*) FROM direct_messages u WHERE u.recipient_id=$1 AND u.sender_id=mine.other AND u.read_at IS NULL AND u.deleted_at IS NULL)
+		mine.edited_at,mine.deleted_at,mine.call_id,mine.call_status,mine.call_media,mine.call_duration,mine.other,
+		(SELECT COUNT(*) FROM direct_messages u WHERE u.recipient_id=$1 AND u.sender_id=mine.other AND u.read_at IS NULL AND u.deleted_at IS NULL
+			AND (u.call_status IS NULL OR u.call_status IN ('missed','cancelled')))
 		FROM (SELECT m.*, CASE WHEN m.sender_id=$1 THEN m.recipient_id ELSE m.sender_id END AS other
 			FROM direct_messages m WHERE m.sender_id=$1 OR m.recipient_id=$1) mine
 		JOIN users ON users.id=mine.other AND users.account_status='active'

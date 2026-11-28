@@ -264,6 +264,7 @@ func (s *Server) realtime(c *gin.Context) {
 	defer func() {
 		if s.hub.remove(cl) {
 			s.broadcastPresence(u.ID, "offline")
+			s.userWentOffline(u.ID)
 		}
 	}()
 

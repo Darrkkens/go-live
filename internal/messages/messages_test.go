@@ -192,6 +192,31 @@ func TestMessageFlow(t *testing.T) {
 		t.Fatalf("edit inside window: %v", err)
 	}
 
+	call, err := store.StartCall(ctx, ana.ID, bia.ID, "call-1", "video", CallRinging)
+	if err != nil || call.Call == nil || call.Call.Status != CallRinging || call.Call.Media != "video" {
+		t.Fatalf("start call: %+v %v", call.Call, err)
+	}
+	if _, err := store.StartCall(ctx, ana.ID, bia.ID, "call-2", "fax", CallRinging); err != ErrInvalid {
+		t.Fatalf("bad media: %v", err)
+	}
+	if _, err := store.Edit(ctx, ana.ID, call.ID, "texto"); err != ErrNotFound {
+		t.Fatalf("call message edited: %v", err)
+	}
+	if _, _, err := store.Delete(ctx, ana.ID, call.ID); err != ErrNotFound {
+		t.Fatalf("call message deleted: %v", err)
+	}
+	ended, err := store.UpdateCall(ctx, "call-1", CallEnded, 75)
+	if err != nil || ended.Call.Status != CallEnded || ended.Call.Duration != 75 || ended.ID != call.ID {
+		t.Fatalf("update call: %+v %v", ended.Call, err)
+	}
+	store.StartCall(ctx, ana.ID, bia.ID, "call-3", "audio", CallRinging)
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if hist, _ := store.History(ctx, ana.ID, bia.ID, 0, 1); hist[0].Call.Status != CallMissed {
+		t.Fatalf("ringing call not closed on restart: %+v", hist[0].Call)
+	}
+
 	unreadBefore := 0
 	for _, c := range mustConversations(t, store, ctx, bia.ID) {
 		if c.ContactID == ana.ID {

@@ -204,6 +204,13 @@ func (s Store) ListContacts(ctx context.Context, currentID string) ([]Contact, e
 	return contacts, rows.Err()
 }
 
+// Contact returns an active user's public profile.
+func (s Store) Contact(ctx context.Context, id string) (Contact, error) {
+	var c Contact
+	err := s.DB.QueryRowContext(ctx, `SELECT id,avatar,username,user_tag,status FROM users WHERE id=$1 AND account_status='active'`, id).Scan(&c.ID, &c.Avatar, &c.Username, &c.UserTag, &c.Status)
+	return c, err
+}
+
 func (s Store) SetAccountStatus(ctx context.Context, id, status string) error {
 	if status != "active" && status != "blocked" {
 		return ErrInvalid
