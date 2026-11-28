@@ -2,8 +2,8 @@ import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useRef, useSta
 import './App.css'
 import { callIcons, callSummary, type CallInfo, type CallJoin, type CallRecord } from './callUtils'
 import { apiBase, avatarSource, request } from './api'
-import { AddMembersDialog, AddServerDialog, ChannelDialog, ConfirmDialog, GuildSettingsDialog, GuildSidebar, InviteDialog, InvitePreviewDialog, MemberList, ServerRail, type GuildAction, type MemberAction } from './guilds'
-import type { Channel, GuildDetail, GuildSummary, Member, VoiceMember } from './guildTypes'
+import { AddMembersDialog, AddServerDialog, ChannelDialog, ChannelSettingsDialog, ConfirmDialog, GuildSidebar, InviteDialog, InvitePreviewDialog, MemberList, ServerRail, ServerSettingsDialog, type GuildAction, type MemberAction, type VoiceAction } from './guilds'
+import { P, has, type Channel, type GuildDetail, type GuildSummary, type Member, type VoiceMember } from './guildTypes'
 import { applyTheme, savedTheme, watchSystemTheme, type ThemePref } from './theme'
 
 type User = {
@@ -24,7 +24,7 @@ type Message = { id: number; senderId: string; recipientId?: string; channelId?:
 type PendingAttachment = { contactId: string; file: File; kind: 'image' | 'file'; preview: string | null }
 type Conversation = { contactId: string; lastMessage: Message; unread: number }
 type Thread = { messages: Message[]; hasMore: boolean; loaded: boolean }
-type RealtimeEvent = { type: 'message' | 'message_updated'; message: Message } | { type: 'read'; readerId: string; readAt: string } | { type: 'presence'; userId: string; status: User['status'] } | { type: 'call'; call: CallInfo } | { type: 'guild'; guildId: string; action: 'updated' | 'removed' } | { type: 'voice'; guildId: string; channelId: string; members: VoiceMember[] }
+type RealtimeEvent = { type: 'message' | 'message_updated'; message: Message } | { type: 'read'; readerId: string; readAt: string } | { type: 'presence'; userId: string; status: User['status'] } | { type: 'call'; call: CallInfo } | { type: 'guild'; guildId: string; action: 'updated' | 'removed' } | { type: 'voice'; guildId: string; channelId: string; members: VoiceMember[] } | { type: 'voice_moved'; channelId: string; guildId: string; url: string; token: string }
 
 // The LiveKit client is large, so the call UI loads on first use.
 const CallScreen = lazy(() => import('./calls').then((m) => ({ default: m.CallScreen })))
@@ -236,7 +236,7 @@ function App() {
   const [channelUnread, setChannelUnread] = useState<Record<string, number>>({})
   const [mobileChannelOpen, setMobileChannelOpen] = useState(false)
   const [showMembers, setShowMembers] = useState(true)
-  const [guildDialog, setGuildDialog] = useState<{ kind: 'add-server' } | { kind: 'invite-preview'; code: string } | { kind: GuildAction } | { kind: 'channel'; channel: Channel | null; voice?: boolean } | { kind: 'confirm'; title: string; text: string; action: string; run: () => Promise<void> } | null>(null)
+  const [guildDialog, setGuildDialog] = useState<{ kind: 'add-server' } | { kind: 'invite-preview'; code: string } | { kind: Exclude<GuildAction, 'settings'> } | { kind: 'settings'; tab?: 'overview' | 'roles' | 'members' } | { kind: 'channel'; channel: Channel | null; voice?: boolean } | { kind: 'confirm'; title: string; text: string; action: string; run: () => Promise<void> } | null>(null)
   const [pendingInvite, setPendingInvite] = useState<string | null>(() => window.location.pathname.match(/^\/convite\/([A-Za-z0-9]{6,16})\/?$/)?.[1] ?? null)
   const channelGuildRef = useRef<Record<string, string>>({})
   type VoiceJoin = { channelId: string; guildId: string; url: string; token: string }
@@ -284,6 +284,11 @@ function App() {
   const isVoiceView = selectedChannel?.kind === 'voice'
   const activeKey = selectedGuildId ? (selectedChannel && !isVoiceView ? `ch:${selectedChannel.id}` : null) : selectedContactId
   const activeChannelId = selectedChannel && !isVoiceView ? selectedChannel.id : null
+  // Your permissions in the open text channel (-1: a direct message, where everything is allowed).
+  const chanPerms = selectedGuild && selectedChannel && !isVoiceView ? selectedGuild.channelPermissions[selectedChannel.id] ?? 0 : -1
+  const canSend = chanPerms === -1 || has(chanPerms, P.sendMessages)
+  const canAttach = chanPerms === -1 || has(chanPerms, P.attachFiles)
+  const canModerate = chanPerms !== -1 && has(chanPerms, P.manageMessages)
   useLayoutEffect(() => { selectedRef.current = panel === 'chat' ? activeKey : null })
 
   useEffect(() => {
@@ -465,6 +470,15 @@ function App() {
         if (data.type === 'message_updated') applyUpdate(data.message)
         if (data.type === 'call') handleCallEvent(data.call)
         if (data.type === 'guild') handleGuildEvent(data.guildId, data.action)
+        if (data.type === 'voice_moved') {
+          // A moderator moved us: follow to the new room, and to its view if we were watching the old one.
+          const { channelId, guildId, url, token } = data
+          setActiveVoice((current) => {
+            setChannelByGuild((all) => all[guildId] === current?.channelId ? { ...all, [guildId]: channelId } : all)
+            return { channelId, guildId, url, token }
+          })
+          notify('success', 'Você foi movido para outro canal de voz.')
+        }
         if (data.type === 'voice') {
           const { channelId, members } = data
           setVoiceByChannel((all) => ({ ...all, [channelId]: members }))
@@ -557,6 +571,7 @@ function App() {
 
   function attachFile(file?: File | null) {
     if (!file || !activeKey) return
+    if (!canSend || !canAttach) { notify('error', 'Você não tem permissão para enviar arquivos neste canal.'); return }
     const isImage = imageTypes.includes(file.type)
     if (!isImage && !documentExtensions.includes(fileExtension(file.name))) {
       notify('error', 'Tipo de arquivo não permitido. Envie imagens, PDF, documentos do Office/LibreOffice, TXT, CSV, MD, ZIP, RAR ou 7z.'); return
@@ -645,6 +660,8 @@ function App() {
 
   async function joinVoice(channel: Channel) {
     if (activeVoice?.channelId === channel.id || voiceBusy) return
+    const perms = guildDetails[channel.guildId]?.channelPermissions[channel.id] ?? 0
+    if (!has(perms, P.connect)) { notify('error', 'Seus cargos não permitem entrar neste canal de voz.'); return }
     if (activeCall) { notify('error', 'Encerre a ligação atual antes de entrar em um canal de voz.'); return }
     setVoiceBusy(true)
     try {
@@ -989,8 +1006,18 @@ function App() {
       } })
       return
     }
-    request<void>(`/api/guilds/${g.id}/members/${member.userId}`, { method: 'PATCH', body: JSON.stringify({ role: action === 'make-admin' ? 'admin' : 'member' }) })
-      .then(() => notify('success', action === 'make-admin' ? `${member.username} agora é admin.` : `${member.username} não é mais admin.`))
+    setGuildDialog({ kind: 'settings', tab: 'members' })
+  }
+
+  function voiceAction(userId: string, action: VoiceAction) {
+    const name = selectedGuild?.members.find((m) => m.userId === userId)?.username ?? 'Membro'
+    const [path, body, done] = action.kind === 'move'
+      ? ['move', { channelId: action.to }, `${name} foi movido.`]
+      : action.kind === 'mute'
+        ? ['mute', { muted: action.muted }, action.muted ? `${name} foi silenciado no servidor.` : `${name} pode falar de novo.`]
+        : ['disconnect', {}, `${name} foi desconectado da voz.`]
+    request<void>(`/api/voice/members/${userId}/${path}`, { method: 'POST', body: JSON.stringify(body) })
+      .then(() => notify('success', done))
       .catch((err: Error) => notify('error', err.message))
   }
 
@@ -1037,7 +1064,7 @@ function App() {
           <ServerRail guilds={guilds} selectedId={selectedGuildId} hasUnread={guildHasUnread} dmUnread={dmUnread} onSelect={openGuild} onAdd={() => setGuildDialog({ kind: 'add-server' })} />
           <aside className="chat-sidebar" aria-label={selectedGuild ? `Canais de ${selectedGuild.name}` : 'Conversas'}>
             {selectedGuildId ? (selectedGuild ? (
-              <GuildSidebar guild={selectedGuild} selectedChannelId={selectedChannel?.id ?? null} unread={channelUnread} voice={voiceByChannel} connectedVoiceId={activeVoice?.channelId ?? null} speaking={speakingIds} onSelectChannel={selectChannel} onAction={guildAction} onEditChannel={(channel) => setGuildDialog({ kind: 'channel', channel })} />
+              <GuildSidebar guild={selectedGuild} me={user.id} onVoiceAction={voiceAction} selectedChannelId={selectedChannel?.id ?? null} unread={channelUnread} voice={voiceByChannel} connectedVoiceId={activeVoice?.channelId ?? null} speaking={speakingIds} onSelectChannel={selectChannel} onAction={guildAction} onEditChannel={(channel) => setGuildDialog({ kind: 'channel', channel })} />
             ) : <p className="sidebar-empty">Carregando servidor…</p>) : (<>
             <div className="sidebar-search">
               <button className="icon-button" type="button" aria-label="Abrir perfil" title="Abrir perfil" onClick={() => setPanel(panel === 'profile' ? 'chat' : 'profile')}><img src="/figma-chat/menu.svg" alt="" /></button>
@@ -1165,7 +1192,7 @@ function App() {
                                       <div className={`message-menu ${menu.up ? 'up' : ''}`} role="menu">
                                         {mine && changeTimeLeft(m, now) > 0 && <button type="button" role="menuitem" onClick={() => startEdit(m)}><MenuIcon path={iconPaths.edit} />{m.attachment ? (m.body ? 'Editar legenda' : 'Adicionar legenda') : 'Editar'}</button>}
                                         {m.body && <button type="button" role="menuitem" onClick={() => copyMessage(m)}><MenuIcon path={iconPaths.copy} />Copiar texto</button>}
-                                        {mine && changeTimeLeft(m, now) > 0 && <button type="button" role="menuitem" className="danger" onClick={() => { setMenu(null); setConfirmDelete(m) }}><MenuIcon path={iconPaths.trash} />Apagar</button>}
+                                        {((mine && changeTimeLeft(m, now) > 0) || canModerate) && <button type="button" role="menuitem" className="danger" onClick={() => { setMenu(null); setConfirmDelete(m) }}><MenuIcon path={iconPaths.trash} />{mine ? 'Apagar' : 'Apagar (moderação)'}</button>}
                                         {mine && <span className="message-menu-note">{changeTimeLeft(m, now) > 0 ? `Editar e apagar: mais ${Math.max(1, Math.ceil(changeTimeLeft(m, now) / 60000))} min` : 'Editar e apagar só nos primeiros 5 minutos'}</span>}
                                         {!mine && !m.body && <span className="message-menu-empty">Sem ações disponíveis</span>}
                                       </div>
@@ -1216,15 +1243,22 @@ function App() {
                           <button type="button" className="image-preview-remove" onClick={discardPending} disabled={sending} aria-label="Remover anexo" title="Remover anexo">×</button>
                         </div>
                       )}
+                      {!canSend ? (
+                        <div className="composer composer-locked" role="note">
+                          <CallIcon path="M6 11h12v10H6zM8 11V7a4 4 0 0 1 8 0v4" size={20} />
+                          <span>Você não tem permissão para enviar mensagens em {conv.label}.</span>
+                        </div>
+                      ) : (
                       <form className="composer" onSubmit={sendMessage}>
-                        <button type="button" className="attach-button" onClick={() => fileInputRef.current?.click()} disabled={sending || isEditing} aria-label="Anexar arquivo do computador" title="Anexar imagem ou arquivo (ou cole com Ctrl+V / arraste)">
+                        {canAttach && <button type="button" className="attach-button" onClick={() => fileInputRef.current?.click()} disabled={sending || isEditing} aria-label="Anexar arquivo do computador" title="Anexar imagem ou arquivo (ou cole com Ctrl+V / arraste)">
                           <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5 12.4 20a5.5 5.5 0 0 1-7.8-7.8l8.9-8.9a3.7 3.7 0 0 1 5.2 5.2l-8.9 8.9a1.8 1.8 0 0 1-2.6-2.6l8.2-8.2" /></svg>
-                        </button>
+                        </button>}
                         <input ref={fileInputRef} type="file" hidden accept={attachmentAccept} onChange={(e) => { attachFile(e.target.files?.[0]); e.target.value = '' }} />
                         <label className="sr-only" htmlFor="composer-input">{isChannel ? `Mensagem em ${conv.label}` : `Mensagem para ${conv.label}`}</label>
                         <textarea id="composer-input" ref={composerRef} rows={1} maxLength={maxMessageLength} placeholder={isEditing ? (editing?.message.attachment ? 'Legenda' : 'Mensagem') : pending?.contactId === conv.key ? 'Adicionar legenda' : isChannel ? `Conversar em ${conv.label}` : 'Mensagem'} value={composerValue} onKeyDown={composerKeyDown} onChange={(e) => isEditing ? setEditDraft(e.target.value) : setDrafts((all) => ({ ...all, [conv.key]: e.target.value }))} />
                         <button type="submit" disabled={sending || (isEditing ? !editDraft.trim() && !editing?.message.attachment : !draft.trim() && pending?.contactId !== conv.key)} aria-label={isEditing ? 'Salvar edição' : 'Enviar mensagem'} title={isEditing ? 'Salvar (Enter)' : 'Enviar (Enter)'}>{isEditing ? <svg className="save-edit-icon" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5" /></svg> : <img src="/figma-chat/send.svg" alt="" />}</button>
                       </form>
+                      )}
                     </div>
                     {dropActive && <div className="drop-overlay" aria-hidden="true"><div><strong>Solte o arquivo aqui</strong><span>Imagens até 10 MB · PDF, documentos e compactados até 25 MB</span></div></div>}
                   </>
@@ -1355,8 +1389,10 @@ function App() {
         switch (guildDialog.kind) {
           case 'invite': return <InviteDialog guild={selectedGuild} onClose={close} notify={notify} />
           case 'add-members': return <AddMembersDialog guild={selectedGuild} contacts={contacts.map((c) => ({ ...c, avatar: c.avatar }))} onClose={close} notify={notify} />
-          case 'settings': return <GuildSettingsDialog guild={selectedGuild} onClose={close} onDeleted={() => { close(); openGuild(null); loadGuilds(); notify('success', 'Servidor excluído.') }} notify={notify} />
-          case 'channel': return <ChannelDialog guild={selectedGuild} channel={guildDialog.channel} initialKind={guildDialog.voice ? 'voice' : 'text'} onClose={close} notify={notify}
+          case 'settings': return <ServerSettingsDialog guild={selectedGuild} me={user.id} initialTab={guildDialog.tab} onClose={close} onDeleted={() => { close(); openGuild(null); loadGuilds(); notify('success', 'Servidor excluído.') }} notify={notify} />
+          case 'channel': return guildDialog.channel
+            ? <ChannelSettingsDialog guild={selectedGuild} channel={guildDialog.channel} onClose={close} onDeleted={() => { close(); void loadGuild(selectedGuild.id); notify('success', 'Canal excluído.') }} notify={notify} />
+            : <ChannelDialog guild={selectedGuild} channel={guildDialog.channel} initialKind={guildDialog.voice ? 'voice' : 'text'} onClose={close} notify={notify}
             onSaved={(saved) => {
               close(); void loadGuild(selectedGuild.id)
               if (saved && saved.kind === 'text') setChannelByGuild((all) => ({ ...all, [selectedGuild.id]: saved.id }))
@@ -1388,6 +1424,8 @@ function App() {
             <VoiceScreen key={`${activeVoice.channelId}:${activeVoice.token}`} join={activeVoice} channelName={channel?.name ?? 'Canal de voz'} guildName={g?.name ?? ''}
               me={{ id: user.id, username: user.username, avatar: user.avatar ? avatarSource(user.avatar) : '' }}
               person={(id) => { const m = members.get(id); return { id, username: m?.username ?? 'Membro', avatar: m?.avatar ? avatarSource(m.avatar) : '' } }}
+              canSpeak={has(g?.channelPermissions[activeVoice.channelId] ?? 0, P.speak)} canVideo={has(g?.channelPermissions[activeVoice.channelId] ?? 0, P.video)}
+              serverMuted={!!voiceByChannel[activeVoice.channelId]?.find((v) => v.userId === user.id)?.serverMuted}
               docked={docked} dockEl={voiceDockEl} miniEl={callMiniEl} onOpen={openVoiceView} onLeave={leaveVoice} onSpeaking={setSpeakingIds} onState={reportVoiceState} notify={notify} />
           </Suspense>
         )
@@ -1396,7 +1434,7 @@ function App() {
         <div className="app-modal-backdrop" onClick={(e) => { if (e.target === e.currentTarget && !deleting) setConfirmDelete(null) }}>
           <div className="app-modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-title" aria-describedby="delete-desc">
             <h2 id="delete-title">Apagar mensagem?</h2>
-            <p id="delete-desc">Ela será apagada para você e para {contacts.find((c) => c.id === confirmDelete.recipientId)?.username ?? 'o contato'}.{confirmDelete.attachment ? ' O anexo também será removido.' : ''} Isso não pode ser desfeito.</p>
+            <p id="delete-desc">{confirmDelete.channelId ? (confirmDelete.senderId === user?.id ? 'Ela será apagada para todos no canal.' : `Você está apagando uma mensagem de ${selectedGuild?.members.find((m) => m.userId === confirmDelete.senderId)?.username ?? 'outro membro'} para todos no canal.`) : `Ela será apagada para você e para ${contacts.find((c) => c.id === confirmDelete.recipientId)?.username ?? 'o contato'}.`}{confirmDelete.attachment ? ' O anexo também será removido.' : ''} Isso não pode ser desfeito.</p>
             {(confirmDelete.body || confirmDelete.attachment) && <blockquote>{confirmDelete.body || confirmDelete.attachment?.name}</blockquote>}
             <div className="form-actions">
               <button ref={deleteCancelRef} type="button" className="ghost-button" onClick={() => setConfirmDelete(null)} disabled={deleting}>Cancelar</button>

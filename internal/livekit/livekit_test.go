@@ -48,3 +48,17 @@ func TestFromEnvDefaults(t *testing.T) {
 		t.Fatalf("api url: %s", cfg.APIURL)
 	}
 }
+
+func TestJoinTokenWithoutSources(t *testing.T) {
+	cfg := Config{APIKey: "key", APISecret: strings.Repeat("s", 32)}
+	token, err := cfg.JoinTokenWith("r", "u", "n", time.Minute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := base64.RawURLEncoding.DecodeString(strings.Split(token, ".")[1])
+	var got claims
+	json.Unmarshal(raw, &got)
+	if *got.Video.CanPublish || len(got.Video.CanPublishSources) != 0 || !*got.Video.CanSubscribe {
+		t.Fatalf("listen-only grant expected: %+v", got.Video)
+	}
+}

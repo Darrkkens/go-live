@@ -94,10 +94,12 @@ type Notify = (kind: 'success' | 'error', message: string) => void
  * Shared by one-to-one calls and voice channels. person() maps a participant
  * identity (the user id) to the name and avatar shown on its tile.
  */
-function useRoom({ url, token, startVideo, notify, person, deafened = false }: {
+function useRoom({ url, token, startVideo, startMic = true, notify, person, deafened = false }: {
   url?: string
   token?: string
   startVideo: boolean
+  /** False when the member may not speak (server mute or channel permission). */
+  startMic?: boolean
   notify: Notify
   person: (identity: string, isLocal: boolean) => CallPerson
   deafened?: boolean
@@ -178,7 +180,7 @@ function useRoom({ url, token, startVideo, notify, person, deafened = false }: {
         if (cancelled) return
         refresh()
         // The room can close while devices start; then the failure is expected and silent.
-        if (!deafRef.current) {
+        if (!deafRef.current && startMic) {
           try { await room.localParticipant.setMicrophoneEnabled(true) }
           catch { if (!cancelled) notify('error', 'Não foi possível usar o microfone. Verifique a permissão do navegador.') }
         }
@@ -397,8 +399,12 @@ const headphonesOff = headphones + 'M3 3l18 18'
 const speaker = 'M11 5 6 9H2v6h4l5 4V5ZM15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14'
 
 /** A voice channel: anyone in the server can drop in and out, like Discord. */
-export function VoiceScreen({ join, channelName, guildName, me, person, docked, dockEl, miniEl, onOpen, onLeave, onSpeaking, onState, notify }: {
+export function VoiceScreen({ join, channelName, guildName, me, person, canSpeak, canVideo, serverMuted, docked, dockEl, miniEl, onOpen, onLeave, onSpeaking, onState, notify }: {
   join: VoiceJoin
+  /** Channel permissions; a moderator's server mute also blocks the microphone. */
+  canSpeak: boolean
+  canVideo: boolean
+  serverMuted: boolean
   channelName: string
   guildName: string
   me: CallPerson
@@ -419,7 +425,9 @@ export function VoiceScreen({ join, channelName, guildName, me, person, docked, 
   const micBeforeDeaf = useRef(true)
   const panelRef = useRef<HTMLElement>(null)
   const { roomRef, audioRef, connection, tiles, micOn, camOn, screenOn, needsAudioClick, failed, toggle } =
-    useRoom({ url: join.url, token: join.token, startVideo: false, notify, deafened, person: (id, isLocal) => isLocal ? me : person(id) })
+    useRoom({ url: join.url, token: join.token, startVideo: false, startMic: canSpeak && !serverMuted, notify, deafened, person: (id, isLocal) => isLocal ? me : person(id) })
+  const micBlocked = !canSpeak || serverMuted
+  const micWhy = serverMuted ? 'Silenciado por um moderador' : 'Você não tem permissão para falar neste canal'
   const connected = connection === ConnectionState.Connected
 
   useEffect(() => {
@@ -444,11 +452,12 @@ export function VoiceScreen({ join, channelName, guildName, me, person, docked, 
       if (micOn) await toggle('mic', false)
     } else {
       setDeafened(false)
-      if (micBeforeDeaf.current) await toggle('mic', true)
+      if (micBeforeDeaf.current && !micBlocked) await toggle('mic', true)
     }
   }
 
   async function toggleMic() {
+    if (micBlocked) { notify('error', `${micWhy}.`); return }
     // Unmuting while deafened also brings the sound back, like Discord.
     if (deafened) { setDeafened(false); await toggle('mic', true); return }
     await toggle('mic')
@@ -472,6 +481,7 @@ export function VoiceScreen({ join, channelName, guildName, me, person, docked, 
       <div className="vc-topbar">
         <span className={`vc-state ${tone}`}><span className="vc-state-dot" />{headline}</span>
         <span className="vc-clock">{count} {count === 1 ? 'pessoa' : 'pessoas'}</span>
+        {serverMuted && <span className="vc-server-muted"><Icon path={callIcons.micOff} size={14} /> Silenciado por um moderador</span>}
         <span className="vc-kind"><Icon path={speaker} size={14} /> {channelName}</span>
       </div>
       {focusedTile ? (
@@ -489,9 +499,9 @@ export function VoiceScreen({ join, channelName, guildName, me, person, docked, 
       {needsAudioClick && <button type="button" className="vc-audio-unlock" onClick={() => void roomRef.current?.startAudio()}>Clique para ativar o áudio</button>}
       <div className="vc-controls">
         <div className="vc-controls-group">
-          <button type="button" className={`vc-btn ${camOn ? 'active' : ''}`} onClick={() => toggle('camera')} aria-pressed={camOn} aria-label={camOn ? 'Desligar câmera' : 'Ligar câmera'} title={camOn ? 'Desligar câmera' : 'Ligar câmera'}><Icon path={camOn ? callIcons.video : callIcons.videoOff} /></button>
-          {canShare && <button type="button" className={`vc-btn ${screenOn ? 'active' : ''}`} onClick={() => toggle('screen')} aria-pressed={screenOn} aria-label={screenOn ? 'Parar de compartilhar a tela' : 'Compartilhar a tela'} title={screenOn ? 'Parar de compartilhar' : 'Compartilhar a tela'}><Icon path={callIcons.screen} /></button>}
-          <button type="button" className={`vc-btn ${micOn ? '' : 'muted'}`} onClick={toggleMic} aria-pressed={!micOn} aria-label={micOn ? 'Desativar microfone' : 'Ativar microfone'} title={micOn ? 'Desativar microfone' : 'Ativar microfone'}><Icon path={micOn ? callIcons.mic : callIcons.micOff} /></button>
+          <button type="button" className={`vc-btn ${camOn ? 'active' : ''}`} onClick={() => toggle('camera')} disabled={!canVideo} aria-pressed={camOn} aria-label={camOn ? 'Desligar câmera' : 'Ligar câmera'} title={!canVideo ? 'Sem permissão para vídeo neste canal' : camOn ? 'Desligar câmera' : 'Ligar câmera'}><Icon path={camOn ? callIcons.video : callIcons.videoOff} /></button>
+          {canShare && <button type="button" className={`vc-btn ${screenOn ? 'active' : ''}`} onClick={() => toggle('screen')} disabled={!canVideo} aria-pressed={screenOn} aria-label={screenOn ? 'Parar de compartilhar a tela' : 'Compartilhar a tela'} title={!canVideo ? 'Sem permissão para compartilhar a tela neste canal' : screenOn ? 'Parar de compartilhar' : 'Compartilhar a tela'}><Icon path={callIcons.screen} /></button>}
+          <button type="button" className={`vc-btn ${micOn ? '' : 'muted'} ${micBlocked ? 'blocked' : ''}`} onClick={toggleMic} aria-pressed={!micOn} aria-disabled={micBlocked} aria-label={micBlocked ? micWhy : micOn ? 'Desativar microfone' : 'Ativar microfone'} title={micBlocked ? micWhy : micOn ? 'Desativar microfone' : 'Ativar microfone'}><Icon path={micOn ? callIcons.mic : callIcons.micOff} /></button>
           <button type="button" className={`vc-btn ${deafened ? 'muted' : ''}`} onClick={toggleDeafen} aria-pressed={deafened} aria-label={deafened ? 'Ativar som' : 'Desativar som (ensurdecer)'} title={deafened ? 'Ativar som' : 'Desativar som'}><Icon path={deafened ? headphonesOff : headphones} /></button>
           <button type="button" className="vc-btn hangup" onClick={onLeave} aria-label="Desconectar do canal de voz" title="Desconectar"><Icon path={callIcons.hangup} /></button>
         </div>

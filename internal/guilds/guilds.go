@@ -7,7 +7,9 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"errors"
+	"fmt"
 	"math/big"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -29,19 +31,6 @@ const (
 	RoleMember = "member"
 )
 
-// Rank orders roles so permissions can be compared.
-func Rank(role string) int {
-	switch role {
-	case RoleOwner:
-		return 3
-	case RoleAdmin:
-		return 2
-	case RoleMember:
-		return 1
-	}
-	return 0
-}
-
 type Guild struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
@@ -52,16 +41,28 @@ type Guild struct {
 }
 
 type Channel struct {
-	ID       string `json:"id"`
-	GuildID  string `json:"guildId"`
-	Name     string `json:"name"`
-	Kind     string `json:"kind"`
-	Topic    string `json:"topic"`
-	Position int    `json:"position"`
+	ID        string `json:"id"`
+	GuildID   string `json:"guildId"`
+	Name      string `json:"name"`
+	Kind      string `json:"kind"`
+	Topic     string `json:"topic"`
+	Position  int    `json:"position"`
+	UserLimit int    `json:"userLimit"`
+}
+
+// Role is a server role ("cargo"). The default role is @todos, which every member has.
+type Role struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Color       string `json:"color"`
+	Position    int    `json:"position"`
+	Permissions uint64 `json:"permissions"`
+	IsDefault   bool   `json:"isDefault"`
 }
 
 type Member struct {
 	UserID   string    `json:"userId"`
+	RoleIDs  []string  `json:"roleIds"`
 	Username string    `json:"username"`
 	UserTag  string    `json:"userTag"`
 	Avatar   string    `json:"avatar"`
@@ -126,6 +127,41 @@ func (s Store) Migrate(ctx context.Context) error {
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='channel_reads_channel_fk') THEN
 			ALTER TABLE channel_reads ADD CONSTRAINT channel_reads_channel_fk FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE;
 		END IF;
+	END $$;
+	ALTER TABLE channels ADD COLUMN IF NOT EXISTS user_limit INT NOT NULL DEFAULT 0;
+	CREATE TABLE IF NOT EXISTS guild_roles (
+		id UUID PRIMARY KEY,
+		guild_id UUID NOT NULL REFERENCES guilds(id) ON DELETE CASCADE,
+		name VARCHAR(32) NOT NULL, color VARCHAR(7) NOT NULL DEFAULT '',
+		position INT NOT NULL, permissions BIGINT NOT NULL DEFAULT 0,
+		is_default BOOLEAN NOT NULL DEFAULT FALSE,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE UNIQUE INDEX IF NOT EXISTS guild_roles_default_idx ON guild_roles (guild_id) WHERE is_default;
+	CREATE TABLE IF NOT EXISTS guild_member_roles (
+		guild_id UUID NOT NULL, user_id UUID NOT NULL,
+		role_id UUID NOT NULL REFERENCES guild_roles(id) ON DELETE CASCADE,
+		PRIMARY KEY (user_id, role_id),
+		FOREIGN KEY (guild_id, user_id) REFERENCES guild_members(guild_id, user_id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS guild_member_roles_guild_idx ON guild_member_roles (guild_id);
+	CREATE TABLE IF NOT EXISTS channel_overrides (
+		channel_id UUID NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+		role_id UUID NOT NULL REFERENCES guild_roles(id) ON DELETE CASCADE,
+		allow BIGINT NOT NULL DEFAULT 0, deny BIGINT NOT NULL DEFAULT 0,
+		PRIMARY KEY (channel_id, role_id)
+	);
+	-- Servers made before roles existed get @todos, and their admins an "Admin" role.
+	DO $$ DECLARE g RECORD; admin_role UUID; BEGIN
+		FOR g IN SELECT id FROM guilds WHERE NOT EXISTS (SELECT 1 FROM guild_roles r WHERE r.guild_id=guilds.id AND r.is_default) LOOP
+			INSERT INTO guild_roles (id,guild_id,name,position,permissions,is_default) VALUES (gen_random_uuid(), g.id, '@todos', 0, `+defaultPermsSQL+`, TRUE);
+			IF EXISTS (SELECT 1 FROM guild_members WHERE guild_id=g.id AND role='admin') THEN
+				admin_role := gen_random_uuid();
+				INSERT INTO guild_roles (id,guild_id,name,color,position,permissions) VALUES (admin_role, g.id, 'Admin', '#3776bd', 1, 1);
+				INSERT INTO guild_member_roles (guild_id,user_id,role_id) SELECT g.id, user_id, admin_role FROM guild_members WHERE guild_id=g.id AND role='admin';
+				UPDATE guild_members SET role='member' WHERE guild_id=g.id AND role='admin';
+			END IF;
+		END LOOP;
 	END $$;`)
 	return err
 }
@@ -187,6 +223,9 @@ func (s Store) Create(ctx context.Context, ownerID, name string) (Guild, error) 
 		return Guild{}, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO channels (id,guild_id,name,position) VALUES ($1,$2,'geral',0)`, uuid.NewString(), g.ID); err != nil {
+		return Guild{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO guild_roles (id,guild_id,name,position,permissions,is_default) VALUES ($1,$2,'@todos',0,$3,TRUE)`, uuid.NewString(), g.ID, int64(DefaultPerms)); err != nil {
 		return Guild{}, err
 	}
 	return g, tx.Commit()
@@ -259,7 +298,7 @@ func (s Store) Delete(ctx context.Context, guildID string) error {
 
 // Channels lists a server's channels in display order.
 func (s Store) Channels(ctx context.Context, guildID string) ([]Channel, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id,guild_id,name,kind,topic,position FROM channels WHERE guild_id=$1 ORDER BY kind, position, created_at`, guildID)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id,guild_id,name,kind,topic,position,user_limit FROM channels WHERE guild_id=$1 ORDER BY kind, position, created_at`, guildID)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +306,7 @@ func (s Store) Channels(ctx context.Context, guildID string) ([]Channel, error) 
 	list := []Channel{}
 	for rows.Next() {
 		var c Channel
-		if err := rows.Scan(&c.ID, &c.GuildID, &c.Name, &c.Kind, &c.Topic, &c.Position); err != nil {
+		if err := rows.Scan(&c.ID, &c.GuildID, &c.Name, &c.Kind, &c.Topic, &c.Position, &c.UserLimit); err != nil {
 			return nil, err
 		}
 		list = append(list, c)
@@ -278,7 +317,7 @@ func (s Store) Channels(ctx context.Context, guildID string) ([]Channel, error) 
 // Channel returns one channel; ErrNotFound if it does not exist.
 func (s Store) Channel(ctx context.Context, channelID string) (Channel, error) {
 	var c Channel
-	err := s.DB.QueryRowContext(ctx, `SELECT id,guild_id,name,kind,topic,position FROM channels WHERE id=$1`, channelID).Scan(&c.ID, &c.GuildID, &c.Name, &c.Kind, &c.Topic, &c.Position)
+	err := s.DB.QueryRowContext(ctx, `SELECT id,guild_id,name,kind,topic,position,user_limit FROM channels WHERE id=$1`, channelID).Scan(&c.ID, &c.GuildID, &c.Name, &c.Kind, &c.Topic, &c.Position, &c.UserLimit)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Channel{}, ErrNotFound
 	}
@@ -303,7 +342,11 @@ func (s Store) CreateChannel(ctx context.Context, guildID, name, topic, kind str
 	return c, err
 }
 
-func (s Store) UpdateChannel(ctx context.Context, channelID, name, topic string) (Channel, error) {
+// UpdateChannel renames a channel and sets its topic and (voice) user limit; 0 is unlimited.
+func (s Store) UpdateChannel(ctx context.Context, channelID, name, topic string, userLimit int) (Channel, error) {
+	if userLimit < 0 || userLimit > 99 {
+		return Channel{}, ErrInvalid
+	}
 	name, err := NormalizeChannelName(name)
 	if err != nil {
 		return Channel{}, err
@@ -312,8 +355,9 @@ func (s Store) UpdateChannel(ctx context.Context, channelID, name, topic string)
 		return Channel{}, err
 	}
 	var c Channel
-	err = s.DB.QueryRowContext(ctx, `UPDATE channels SET name=$2, topic=$3 WHERE id=$1 RETURNING id,guild_id,name,kind,topic,position`, channelID, name, topic).
-		Scan(&c.ID, &c.GuildID, &c.Name, &c.Kind, &c.Topic, &c.Position)
+	err = s.DB.QueryRowContext(ctx, `UPDATE channels SET name=$2, topic=$3, user_limit=CASE WHEN kind='voice' THEN $4 ELSE 0 END WHERE id=$1
+		RETURNING id,guild_id,name,kind,topic,position,user_limit`, channelID, name, topic, userLimit).
+		Scan(&c.ID, &c.GuildID, &c.Name, &c.Kind, &c.Topic, &c.Position, &c.UserLimit)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Channel{}, ErrNotFound
 	}
@@ -387,9 +431,31 @@ func (s Store) Members(ctx context.Context, guildID string) ([]Member, error) {
 		if err := rows.Scan(&m.UserID, &m.Username, &m.UserTag, &m.Avatar, &m.Status, &m.Role, &m.JoinedAt); err != nil {
 			return nil, err
 		}
+		m.RoleIDs = []string{}
 		list = append(list, m)
 	}
-	return list, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	roles, err := s.DB.QueryContext(ctx, `SELECT user_id, role_id FROM guild_member_roles WHERE guild_id=$1`, guildID)
+	if err != nil {
+		return nil, err
+	}
+	defer roles.Close()
+	index := map[string]int{}
+	for i, m := range list {
+		index[m.UserID] = i
+	}
+	for roles.Next() {
+		var user, role string
+		if err := roles.Scan(&user, &role); err != nil {
+			return nil, err
+		}
+		if i, ok := index[user]; ok {
+			list[i].RoleIDs = append(list[i].RoleIDs, role)
+		}
+	}
+	return list, roles.Err()
 }
 
 // MemberIDs lists the user ids of a server, for realtime events.
@@ -418,21 +484,6 @@ func (s Store) AddMember(ctx context.Context, guildID, userID string) (bool, err
 // RemoveMember removes a member; the owner cannot be removed.
 func (s Store) RemoveMember(ctx context.Context, guildID, userID string) error {
 	res, err := s.DB.ExecContext(ctx, `DELETE FROM guild_members WHERE guild_id=$1 AND user_id=$2 AND role<>'owner'`, guildID, userID)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// SetRole makes a member an admin or a regular member.
-func (s Store) SetRole(ctx context.Context, guildID, userID, role string) error {
-	if role != RoleAdmin && role != RoleMember {
-		return ErrInvalid
-	}
-	res, err := s.DB.ExecContext(ctx, `UPDATE guild_members SET role=$3 WHERE guild_id=$1 AND user_id=$2 AND role<>'owner'`, guildID, userID, role)
 	if err != nil {
 		return err
 	}
@@ -518,4 +569,216 @@ func (s Store) Accept(ctx context.Context, code, userID string) (string, bool, e
 		}
 	}
 	return guildID, joined > 0, tx.Commit()
+}
+
+var defaultPermsSQL = fmt.Sprint(DefaultPerms)
+
+var colorPattern = regexp.MustCompile(`^(#[0-9a-fA-F]{6})?$`)
+
+func normalizeRole(name, color string) (string, string, error) {
+	name = strings.Join(strings.Fields(name), " ")
+	if n := utf8.RuneCountInString(name); n < 1 || n > 32 || name == "@todos" || !colorPattern.MatchString(color) {
+		return "", "", ErrInvalid
+	}
+	return name, strings.ToLower(color), nil
+}
+
+// Roles lists a server's roles from the top of the hierarchy down; @todos is last.
+func (s Store) Roles(ctx context.Context, guildID string) ([]Role, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT id,name,color,position,permissions,is_default FROM guild_roles WHERE guild_id=$1 ORDER BY position DESC`, guildID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	list := []Role{}
+	for rows.Next() {
+		var r Role
+		var perms int64
+		if err := rows.Scan(&r.ID, &r.Name, &r.Color, &r.Position, &perms, &r.IsDefault); err != nil {
+			return nil, err
+		}
+		r.Permissions = uint64(perms)
+		list = append(list, r)
+	}
+	return list, rows.Err()
+}
+
+// Role returns one role of a server.
+func (s Store) RoleByID(ctx context.Context, guildID, roleID string) (Role, error) {
+	var r Role
+	var perms int64
+	err := s.DB.QueryRowContext(ctx, `SELECT id,name,color,position,permissions,is_default FROM guild_roles WHERE id=$1 AND guild_id=$2`, roleID, guildID).
+		Scan(&r.ID, &r.Name, &r.Color, &r.Position, &perms, &r.IsDefault)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Role{}, ErrNotFound
+	}
+	r.Permissions = uint64(perms)
+	return r, err
+}
+
+// CreateRole adds a role right above @todos, like Discord.
+func (s Store) CreateRole(ctx context.Context, guildID, name, color string, perms uint64) (Role, error) {
+	name, color, err := normalizeRole(name, color)
+	if err != nil {
+		return Role{}, err
+	}
+	var count int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM guild_roles WHERE guild_id=$1`, guildID).Scan(&count); err != nil {
+		return Role{}, err
+	}
+	if count >= 50 {
+		return Role{}, ErrInvalid
+	}
+	r := Role{ID: uuid.NewString(), Name: name, Color: color, Position: 1, Permissions: perms & PermAll}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return Role{}, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE guild_roles SET position=position+1 WHERE guild_id=$1 AND NOT is_default`, guildID); err != nil {
+		return Role{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO guild_roles (id,guild_id,name,color,position,permissions) VALUES ($1,$2,$3,$4,1,$5)`, r.ID, guildID, name, color, int64(r.Permissions)); err != nil {
+		return Role{}, err
+	}
+	return r, tx.Commit()
+}
+
+// UpdateRole changes a role. @todos keeps its name and color.
+func (s Store) UpdateRole(ctx context.Context, guildID, roleID, name, color string, perms uint64) (Role, error) {
+	current, err := s.RoleByID(ctx, guildID, roleID)
+	if err != nil {
+		return Role{}, err
+	}
+	if current.IsDefault {
+		name, color = current.Name, ""
+	} else if name, color, err = normalizeRole(name, color); err != nil {
+		return Role{}, err
+	}
+	_, err = s.DB.ExecContext(ctx, `UPDATE guild_roles SET name=$3, color=$4, permissions=$5 WHERE id=$1 AND guild_id=$2`, roleID, guildID, name, color, int64(perms&PermAll))
+	current.Name, current.Color, current.Permissions = name, color, perms&PermAll
+	return current, err
+}
+
+// DeleteRole removes a role (never @todos) and closes the gap in positions.
+func (s Store) DeleteRole(ctx context.Context, guildID, roleID string) error {
+	r, err := s.RoleByID(ctx, guildID, roleID)
+	if err != nil {
+		return err
+	}
+	if r.IsDefault {
+		return ErrInvalid
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM guild_roles WHERE id=$1`, roleID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE guild_roles SET position=position-1 WHERE guild_id=$1 AND position>$2`, guildID, r.Position); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MoveRole swaps a role with its neighbor above (up) or below; @todos stays at the bottom.
+// It returns the neighbor so callers can check they may move it too.
+func (s Store) MoveRole(ctx context.Context, guildID, roleID string, up bool) (Role, error) {
+	r, err := s.RoleByID(ctx, guildID, roleID)
+	if err != nil {
+		return Role{}, err
+	}
+	target := r.Position - 1
+	if up {
+		target = r.Position + 1
+	}
+	if r.IsDefault || target < 1 {
+		return Role{}, ErrInvalid
+	}
+	var other Role
+	err = s.DB.QueryRowContext(ctx, `SELECT id,position FROM guild_roles WHERE guild_id=$1 AND position=$2`, guildID, target).Scan(&other.ID, &other.Position)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Role{}, ErrInvalid
+	}
+	if err != nil {
+		return Role{}, err
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return Role{}, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE guild_roles SET position=$2 WHERE id=$1`, other.ID, r.Position); err != nil {
+		return Role{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE guild_roles SET position=$2 WHERE id=$1`, r.ID, target); err != nil {
+		return Role{}, err
+	}
+	return other, tx.Commit()
+}
+
+// SetMemberRoles replaces a member's roles. Unknown or default roles are rejected.
+func (s Store) SetMemberRoles(ctx context.Context, guildID, userID string, roleIDs []string) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM guild_member_roles WHERE guild_id=$1 AND user_id=$2`, guildID, userID); err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	for _, id := range roleIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		res, err := tx.ExecContext(ctx, `INSERT INTO guild_member_roles (guild_id,user_id,role_id)
+			SELECT $1,$2,id FROM guild_roles WHERE id=$3 AND guild_id=$1 AND NOT is_default`, guildID, userID, id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrInvalid
+		}
+	}
+	return tx.Commit()
+}
+
+// Overrides lists the role overrides of every channel in a server.
+func (s Store) Overrides(ctx context.Context, guildID string) (map[string][]Override, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT o.channel_id,o.role_id,o.allow,o.deny FROM channel_overrides o
+		JOIN channels c ON c.id=o.channel_id JOIN guild_roles r ON r.id=o.role_id
+		WHERE c.guild_id=$1 ORDER BY r.position DESC`, guildID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]Override{}
+	for rows.Next() {
+		var ch string
+		var o Override
+		var allow, deny int64
+		if err := rows.Scan(&ch, &o.RoleID, &allow, &deny); err != nil {
+			return nil, err
+		}
+		o.Allow, o.Deny = uint64(allow), uint64(deny)
+		out[ch] = append(out[ch], o)
+	}
+	return out, rows.Err()
+}
+
+// SetOverride changes what a role may do in one channel; allow=deny=0 removes it.
+func (s Store) SetOverride(ctx context.Context, channelID, roleID string, allow, deny uint64) error {
+	allow, deny = allow&ChannelPerms, deny&ChannelPerms&^allow
+	if allow == 0 && deny == 0 {
+		_, err := s.DB.ExecContext(ctx, `DELETE FROM channel_overrides WHERE channel_id=$1 AND role_id=$2`, channelID, roleID)
+		return err
+	}
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO channel_overrides (channel_id,role_id,allow,deny)
+		SELECT c.id, r.id, $3, $4 FROM channels c JOIN guild_roles r ON r.guild_id=c.guild_id WHERE c.id=$1 AND r.id=$2
+		ON CONFLICT (channel_id,role_id) DO UPDATE SET allow=EXCLUDED.allow, deny=EXCLUDED.deny`, channelID, roleID, int64(allow), int64(deny))
+	return err
 }

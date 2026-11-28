@@ -81,16 +81,10 @@ func TestGuildFlow(t *testing.T) {
 	if added, err := store.AddMember(ctx, g.ID, bia.ID); err != nil || added {
 		t.Fatalf("add twice: %v %v", added, err)
 	}
-	if err := store.SetRole(ctx, g.ID, bia.ID, RoleAdmin); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SetRole(ctx, g.ID, ana.ID, RoleMember); err != ErrNotFound {
-		t.Fatalf("owner demoted: %v", err)
-	}
 	if err := store.RemoveMember(ctx, g.ID, ana.ID); err != ErrNotFound {
 		t.Fatalf("owner removed: %v", err)
 	}
-	if role, _ := store.Role(ctx, g.ID, bia.ID); role != RoleAdmin {
+	if role, _ := store.Role(ctx, g.ID, bia.ID); role != RoleMember {
 		t.Fatalf("role: %s", role)
 	}
 	if _, err := store.Role(ctx, g.ID, caio.ID); err != ErrNotFound {
@@ -116,7 +110,7 @@ func TestGuildFlow(t *testing.T) {
 	if _, err := store.Preview(ctx, old.Code, caio.ID); err != ErrInviteInvalid {
 		t.Fatalf("expired invite: %v", err)
 	}
-	if members, _ := store.Members(ctx, g.ID); len(members) != 3 || members[0].Role != RoleOwner || members[1].Role != RoleAdmin {
+	if members, _ := store.Members(ctx, g.ID); len(members) != 3 || members[0].Role != RoleOwner {
 		t.Fatalf("members: %+v", members)
 	}
 
@@ -193,4 +187,34 @@ func TestGuildFlow(t *testing.T) {
 	if list, _ := store.ListForUser(ctx, caio.ID); len(list) != 0 {
 		t.Fatalf("deleted server still listed: %+v", list)
 	}
+}
+
+// testDB starts Postgres with the users, messages and servers tables.
+func testDB(t *testing.T) (*sql.DB, func(string) accounts.User, Store, func()) {
+	t.Helper()
+	ctx := context.Background()
+	container, err := postgres.Run(ctx, "postgres:latest", postgres.WithDatabase("go_live"), postgres.WithUsername("test"), postgres.WithPassword("test"), testcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(60*time.Second)))
+	if err != nil {
+		t.Skipf("Docker unavailable: %v", err)
+	}
+	host, _ := container.Host(ctx)
+	port, _ := container.MappedPort(ctx, "5432/tcp")
+	db, err := sql.Open("pgx", fmt.Sprintf("postgres://test:test@%s:%s/go_live?sslmode=disable", host, port.Port()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accts, msgs, store := accounts.Store{DB: db}, messages.Store{DB: db}, Store{DB: db}
+	for _, m := range []func(context.Context) error{accts.Migrate, msgs.Migrate, store.Migrate} {
+		if err := m(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk := func(tag string) accounts.User {
+		u, err := accts.Create(ctx, accounts.CreateInput{Username: tag, Email: tag + "@example.com", UserTag: tag, Password: "long secure password"}, "user")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	return db, mk, store, func() { db.Close(); container.Terminate(ctx) }
 }
