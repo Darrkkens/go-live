@@ -323,6 +323,24 @@ func (s Store) Delete(ctx context.Context, userID string, messageID int64) (Mess
 	return m, file.String, err
 }
 
+// DeleteAny removes any channel message (moderation), with no time limit.
+func (s Store) DeleteAny(ctx context.Context, messageID int64) (Message, string, error) {
+	var m Message
+	var file sql.NullString
+	err := scanInto(s.DB.QueryRowContext(ctx, `WITH old AS (
+			SELECT id, attachment_name FROM direct_messages WHERE id=$1 AND channel_id IS NOT NULL AND deleted_at IS NULL FOR UPDATE
+		)
+		UPDATE direct_messages m SET body='', deleted_at=NOW(), edited_at=NULL, attachment_name=NULL, attachment_type=NULL,
+			attachment_width=NULL, attachment_height=NULL, attachment_original_name=NULL, attachment_size=NULL
+		FROM old WHERE m.id=old.id
+		RETURNING m.id,m.sender_id,m.recipient_id,m.body,m.created_at,m.read_at,m.attachment_name,m.attachment_type,m.attachment_width,
+			m.attachment_height,m.attachment_original_name,m.attachment_size,m.edited_at,m.deleted_at,m.call_id,m.call_status,m.call_media,m.call_duration,m.channel_id,old.attachment_name`, messageID), &m, &file)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Message{}, "", ErrNotFound
+	}
+	return m, file.String, err
+}
+
 // StartCall records a call from caller to an active callee with the given status.
 func (s Store) StartCall(ctx context.Context, callerID, calleeID, callID, media, status string) (Message, error) {
 	if callerID == calleeID {

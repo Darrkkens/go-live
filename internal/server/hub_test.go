@@ -54,11 +54,11 @@ func TestEndStatus(t *testing.T) {
 
 func TestVoiceManager(t *testing.T) {
 	v := newVoiceManager()
-	if prev, ok := v.join("g", "c1", "a"); !ok || prev != "" {
+	if prev, ok := v.join("g", "c1", "a", 0, false); !ok || prev != "" {
 		t.Fatal("first join")
 	}
-	v.join("g", "c1", "b")
-	if prev, ok := v.join("g", "c2", "a"); !ok || prev != "c1" {
+	v.join("g", "c1", "b", 0, false)
+	if prev, ok := v.join("g", "c2", "a", 0, false); !ok || prev != "c1" {
 		t.Fatalf("move: %q", prev)
 	}
 	if got := v.forGuild("g"); len(got["c1"]) != 1 || len(got["c2"]) != 1 || got["c1"][0].UserID != "b" {
@@ -80,9 +80,37 @@ func TestVoiceManager(t *testing.T) {
 		t.Fatalf("clear: %v", ids)
 	}
 	for i := 0; i < maxVoiceMembers; i++ {
-		v.join("g", "full", string(rune('A'+i)))
+		v.join("g", "full", string(rune('A'+i)), 0, false)
 	}
-	if _, ok := v.join("g", "full", "late"); ok {
+	if _, ok := v.join("g", "full", "late", 0, false); ok {
 		t.Fatal("joined a full channel")
+	}
+}
+
+func TestVoiceLimitAndServerMute(t *testing.T) {
+	v := newVoiceManager()
+	v.join("g", "c", "a", 2, false)
+	v.join("g", "c", "b", 2, false)
+	if _, ok := v.join("g", "c", "c", 2, false); ok {
+		t.Fatal("joined a channel at its limit")
+	}
+	if _, ok := v.join("g", "c", "mod", 2, true); !ok {
+		t.Fatal("moderator blocked by the limit")
+	}
+	if ch := v.setServerMute("g", "a", true); ch != "c" || !v.isServerMuted("g", "a") {
+		t.Fatal("server mute not applied")
+	}
+	v.setState("a", false, false, false, false)
+	if m := v.forGuild("g")["c"][0]; !m.Muted || !m.ServerMuted {
+		t.Fatalf("server-muted member unmuted themselves: %+v", m)
+	}
+	v.leave("a")
+	v.join("g", "c2", "a", 0, false)
+	if m := v.forGuild("g")["c2"][0]; !m.ServerMuted {
+		t.Fatal("server mute lost when rejoining")
+	}
+	v.setServerMute("g", "a", false)
+	if v.isServerMuted("g", "a") {
+		t.Fatal("unmute failed")
 	}
 }

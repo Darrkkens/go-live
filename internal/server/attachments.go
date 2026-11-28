@@ -18,6 +18,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/Darrkkens/go-live/internal/guilds"
 	"github.com/Darrkkens/go-live/internal/messages"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -184,8 +185,12 @@ func (s *Server) sendChannelAttachment(c *gin.Context) {
 	if !ok {
 		return
 	}
-	ch, _, ok := s.channelForMember(c, u.ID)
+	ch, access, ok := s.channelForMember(c, u.ID)
 	if !ok {
+		return
+	}
+	if !access.Can(ch.ID, guilds.PermSendMessages|guilds.PermAttachFiles) {
+		forbidden(c, "Você não pode enviar arquivos neste canal.")
 		return
 	}
 	s.uploadAndSend(c, func(caption string, a *messages.Attachment) (messages.Message, error) {

@@ -32,7 +32,8 @@ func (s *Server) audience(ctx context.Context, m messages.Message) []string {
 	if err != nil {
 		return nil
 	}
-	ids, _ := s.guilds.MemberIDs(ctx, ch.GuildID)
+	// Private channels: only people who can see the channel get its events.
+	ids, _ := s.guilds.ChannelViewers(ctx, ch.GuildID, ch.ID)
 	return ids
 }
 
@@ -51,8 +52,8 @@ func (s *Server) canSee(ctx context.Context, userID string, m messages.Message) 
 	if err != nil {
 		return false
 	}
-	_, err = s.guilds.Role(ctx, ch.GuildID, userID)
-	return err == nil
+	a, err := s.guilds.Access(ctx, ch.GuildID, userID)
+	return err == nil && a.Can(ch.ID, guilds.PermViewChannel)
 }
 
 func (s *Server) notifyGuild(guildID, action string, extra ...string) {
@@ -70,43 +71,63 @@ func removeFiles(files []string) {
 	}
 }
 
-// guildRole loads the URL's server and requires at least minRole.
-func (s *Server) guildRole(c *gin.Context, userID, minRole string) (string, string, bool) {
+func forbidden(c *gin.Context, msg string) {
+	if msg == "" {
+		msg = "Você não tem permissão para isso neste servidor."
+	}
+	c.JSON(http.StatusForbidden, gin.H{"error": msg})
+}
+
+// guildAccess loads the URL's server and the user's permissions there,
+// requiring the server-wide permissions in need (0 only requires membership).
+func (s *Server) guildAccess(c *gin.Context, userID string, need uint64) (string, guilds.Access, bool) {
 	guildID := c.Param("id")
 	if _, err := uuid.Parse(guildID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Servidor não encontrado."})
-		return "", "", false
+		return "", guilds.Access{}, false
 	}
-	role, err := s.guilds.Role(c.Request.Context(), guildID, userID)
+	a, err := s.guilds.Access(c.Request.Context(), guildID, userID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Servidor não encontrado."})
-		return "", "", false
+		return "", guilds.Access{}, false
 	}
-	if guilds.Rank(role) < guilds.Rank(minRole) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Você não tem permissão para isso neste servidor."})
-		return "", "", false
+	if !a.Has(need) {
+		forbidden(c, "")
+		return "", guilds.Access{}, false
 	}
-	return guildID, role, true
+	return guildID, a, true
 }
 
-// channelForMember loads the URL's channel if the user belongs to its server.
-func (s *Server) channelForMember(c *gin.Context, userID string) (guilds.Channel, string, bool) {
+// channelForMember loads the URL's channel if the user can see it, with their permissions.
+// Channels the user cannot see answer 404, so private channels stay hidden.
+func (s *Server) channelForMember(c *gin.Context, userID string) (guilds.Channel, guilds.Access, bool) {
 	id := c.Param("channelId")
 	if _, err := uuid.Parse(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Canal não encontrado."})
-		return guilds.Channel{}, "", false
+		return guilds.Channel{}, guilds.Access{}, false
 	}
 	ch, err := s.guilds.Channel(c.Request.Context(), id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Canal não encontrado."})
-		return guilds.Channel{}, "", false
+		return guilds.Channel{}, guilds.Access{}, false
 	}
-	role, err := s.guilds.Role(c.Request.Context(), ch.GuildID, userID)
-	if err != nil {
+	a, err := s.guilds.Access(c.Request.Context(), ch.GuildID, userID)
+	if err != nil || !a.Can(ch.ID, guilds.PermViewChannel) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Canal não encontrado."})
-		return guilds.Channel{}, "", false
+		return guilds.Channel{}, guilds.Access{}, false
 	}
-	return ch, role, true
+	return ch, a, true
+}
+
+// visibleChannels keeps the channels the member can see.
+func visibleChannels(a guilds.Access, channels []guilds.Channel) []guilds.Channel {
+	out := make([]guilds.Channel, 0, len(channels))
+	for _, ch := range channels {
+		if a.Can(ch.ID, guilds.PermViewChannel) {
+			out = append(out, ch)
+		}
+	}
+	return out
 }
 
 type guildDetail struct {
@@ -115,6 +136,12 @@ type guildDetail struct {
 	Members  []guilds.Member          `json:"members"`
 	Unread   map[string]int           `json:"unread"`
 	Voice    map[string][]voiceMember `json:"voice"`
+	Roles    []guilds.Role            `json:"roles"`
+	// Permissions are the viewer's server-wide permissions; ChannelPermissions per visible channel.
+	Permissions        uint64                       `json:"permissions"`
+	ChannelPermissions map[string]uint64            `json:"channelPermissions"`
+	Overrides          map[string][]guilds.Override `json:"overrides"`
+	MyTop              int                          `json:"myTop"`
 }
 
 func (s *Server) listGuilds(c *gin.Context) {
@@ -135,6 +162,9 @@ func (s *Server) listGuilds(c *gin.Context) {
 	out := make([]item, 0, len(list))
 	for _, g := range list {
 		channels, _ := s.guilds.Channels(c.Request.Context(), g.ID)
+		if a, err := s.guilds.Access(c.Request.Context(), g.ID, u.ID); err == nil {
+			channels = visibleChannels(a, channels)
+		}
 		ids := make([]string, 0, len(channels))
 		for _, ch := range channels {
 			ids = append(ids, ch.ID)
@@ -181,7 +211,7 @@ func (s *Server) getGuild(c *gin.Context) {
 	if !ok {
 		return
 	}
-	guildID, _, ok := s.guildRole(c, u.ID, guilds.RoleMember)
+	guildID, a, ok := s.guildAccess(c, u.ID, 0)
 	if !ok {
 		return
 	}
@@ -189,7 +219,8 @@ func (s *Server) getGuild(c *gin.Context) {
 	g, err1 := s.guilds.Get(ctx, guildID, u.ID)
 	channels, err2 := s.guilds.Channels(ctx, guildID)
 	members, err3 := s.guilds.Members(ctx, guildID)
-	if err := errors.Join(err1, err2, err3); err != nil {
+	roles, err4 := s.guilds.Roles(ctx, guildID)
+	if err := errors.Join(err1, err2, err3, err4); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível carregar o servidor."})
 		return
 	}
@@ -204,7 +235,33 @@ func (s *Server) getGuild(c *gin.Context) {
 			members[i].Status = "offline"
 		}
 	}
-	c.JSON(http.StatusOK, guildDetail{Guild: g, Channels: channels, Members: members, Unread: unread, Voice: s.voice.forGuild(guildID)})
+	channels = visibleChannels(a, channels)
+	channelPerms := make(map[string]uint64, len(channels))
+	for _, ch := range channels {
+		channelPerms[ch.ID] = a.Channel(ch.ID)
+	}
+	voice := map[string][]voiceMember{}
+	for id, list := range s.voice.forGuild(guildID) {
+		if _, visible := channelPerms[id]; visible {
+			voice[id] = list
+		}
+	}
+	// Overrides are only needed (and shown) to people who can edit channels.
+	overrides := map[string][]guilds.Override{}
+	if a.Has(guilds.PermManageRoles) || a.Has(guilds.PermManageChannels) {
+		all, _ := s.guilds.Overrides(ctx, guildID)
+		for id, list := range all {
+			if _, visible := channelPerms[id]; visible {
+				overrides[id] = list
+			}
+		}
+	}
+	top := a.Top()
+	if a.Owner {
+		top = 1 << 30
+	}
+	c.JSON(http.StatusOK, guildDetail{Guild: g, Channels: channels, Members: members, Unread: unread, Voice: voice, Roles: roles,
+		Permissions: a.Guild(), ChannelPermissions: channelPerms, Overrides: overrides, MyTop: top})
 }
 
 func (s *Server) updateGuild(c *gin.Context) {
@@ -215,7 +272,7 @@ func (s *Server) updateGuild(c *gin.Context) {
 	if !ok {
 		return
 	}
-	guildID, _, ok := s.guildRole(c, u.ID, guilds.RoleOwner)
+	guildID, _, ok := s.guildAccess(c, u.ID, guilds.PermManageGuild)
 	if !ok {
 		return
 	}
@@ -242,8 +299,12 @@ func (s *Server) deleteGuild(c *gin.Context) {
 	if !ok {
 		return
 	}
-	guildID, _, ok := s.guildRole(c, u.ID, guilds.RoleOwner)
+	guildID, a, ok := s.guildAccess(c, u.ID, 0)
 	if !ok {
+		return
+	}
+	if !a.Owner {
+		forbidden(c, "Só o dono pode excluir o servidor.")
 		return
 	}
 	ctx := c.Request.Context()
@@ -275,7 +336,7 @@ func (s *Server) guildIcon(c *gin.Context) {
 	if !ok {
 		return
 	}
-	guildID, _, ok := s.guildRole(c, u.ID, guilds.RoleAdmin)
+	guildID, _, ok := s.guildAccess(c, u.ID, guilds.PermManageGuild)
 	if !ok {
 		return
 	}
@@ -306,11 +367,11 @@ func (s *Server) leaveGuild(c *gin.Context) {
 	if !ok {
 		return
 	}
-	guildID, role, ok := s.guildRole(c, u.ID, guilds.RoleMember)
+	guildID, a, ok := s.guildAccess(c, u.ID, 0)
 	if !ok {
 		return
 	}
-	if role == guilds.RoleOwner {
+	if a.Owner {
 		c.JSON(http.StatusConflict, gin.H{"error": "O dono não pode sair. Exclua o servidor ou continue como dono."})
 		return
 	}
@@ -332,7 +393,7 @@ func (s *Server) addGuildMember(c *gin.Context) {
 	if !ok {
 		return
 	}
-	guildID, _, ok := s.guildRole(c, u.ID, guilds.RoleAdmin)
+	guildID, _, ok := s.guildAccess(c, u.ID, guilds.PermAddMembers)
 	if !ok {
 		return
 	}
@@ -362,38 +423,6 @@ func (s *Server) addGuildMember(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-func (s *Server) updateGuildMember(c *gin.Context) {
-	if !s.sameOrigin(c) {
-		return
-	}
-	u, ok := s.currentUser(c)
-	if !ok {
-		return
-	}
-	guildID, _, ok := s.guildRole(c, u.ID, guilds.RoleOwner)
-	if !ok {
-		return
-	}
-	var body struct {
-		Role string `json:"role"`
-	}
-	if c.ShouldBindJSON(&body) != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Dados inválidos."})
-		return
-	}
-	err := s.guilds.SetRole(c.Request.Context(), guildID, c.Param("userId"), body.Role)
-	if errors.Is(err, guilds.ErrInvalid) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Cargo inválido."})
-		return
-	}
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Membro não encontrado."})
-		return
-	}
-	s.notifyGuild(guildID, "updated")
-	c.Status(http.StatusNoContent)
-}
-
 func (s *Server) removeGuildMember(c *gin.Context) {
 	if !s.sameOrigin(c) {
 		return
@@ -402,19 +431,19 @@ func (s *Server) removeGuildMember(c *gin.Context) {
 	if !ok {
 		return
 	}
-	guildID, role, ok := s.guildRole(c, u.ID, guilds.RoleAdmin)
+	guildID, a, ok := s.guildAccess(c, u.ID, guilds.PermKickMembers)
 	if !ok {
 		return
 	}
 	target := c.Param("userId")
-	targetRole, err := s.guilds.Role(c.Request.Context(), guildID, target)
+	other, err := s.guilds.Access(c.Request.Context(), guildID, target)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Membro não encontrado."})
 		return
 	}
-	// Admins remove members; only the owner removes admins; nobody removes the owner.
-	if guilds.Rank(targetRole) >= guilds.Rank(role) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Você não pode remover este membro."})
+	// Only people below you in the role hierarchy; nobody removes the owner.
+	if !a.Outranks(other) {
+		forbidden(c, "Você só pode remover quem tem um cargo abaixo do seu.")
 		return
 	}
 	if err := s.guilds.RemoveMember(c.Request.Context(), guildID, target); err != nil {
@@ -435,7 +464,7 @@ func (s *Server) createChannel(c *gin.Context) {
 	if !ok {
 		return
 	}
-	guildID, _, ok := s.guildRole(c, u.ID, guilds.RoleAdmin)
+	guildID, _, ok := s.guildAccess(c, u.ID, guilds.PermManageChannels)
 	if !ok {
 		return
 	}
@@ -472,25 +501,26 @@ func (s *Server) updateChannel(c *gin.Context) {
 	if !ok {
 		return
 	}
-	ch, role, ok := s.channelForMember(c, u.ID)
+	ch, a, ok := s.channelForMember(c, u.ID)
 	if !ok {
 		return
 	}
-	if guilds.Rank(role) < guilds.Rank(guilds.RoleAdmin) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Só donos e admins editam canais."})
+	if !a.Can(ch.ID, guilds.PermManageChannels) {
+		forbidden(c, "Você não tem permissão para editar este canal.")
 		return
 	}
 	var body struct {
-		Name  string `json:"name"`
-		Topic string `json:"topic"`
+		Name      string `json:"name"`
+		Topic     string `json:"topic"`
+		UserLimit int    `json:"userLimit"`
 	}
 	if c.ShouldBindJSON(&body) != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Dados inválidos."})
 		return
 	}
-	updated, err := s.guilds.UpdateChannel(c.Request.Context(), ch.ID, body.Name, body.Topic)
+	updated, err := s.guilds.UpdateChannel(c.Request.Context(), ch.ID, body.Name, body.Topic, body.UserLimit)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Use um nome de canal com até 40 letras ou números e um tópico de até 200 caracteres."})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Use um nome de canal com até 40 letras ou números, um tópico de até 200 caracteres e um limite de 0 a 99 pessoas."})
 		return
 	}
 	s.notifyGuild(ch.GuildID, "updated")
@@ -505,12 +535,12 @@ func (s *Server) deleteChannel(c *gin.Context) {
 	if !ok {
 		return
 	}
-	ch, role, ok := s.channelForMember(c, u.ID)
+	ch, a, ok := s.channelForMember(c, u.ID)
 	if !ok {
 		return
 	}
-	if guilds.Rank(role) < guilds.Rank(guilds.RoleAdmin) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Só donos e admins excluem canais."})
+	if !a.Can(ch.ID, guilds.PermManageChannels) {
+		forbidden(c, "Você não tem permissão para excluir este canal.")
 		return
 	}
 	files, err := s.guilds.DeleteChannel(c.Request.Context(), ch.ID)
@@ -557,8 +587,12 @@ func (s *Server) sendChannelMessage(c *gin.Context) {
 	if !ok {
 		return
 	}
-	ch, _, ok := s.channelForMember(c, u.ID)
+	ch, a, ok := s.channelForMember(c, u.ID)
 	if !ok {
+		return
+	}
+	if !a.Can(ch.ID, guilds.PermSendMessages) {
+		forbidden(c, "Você não pode enviar mensagens neste canal.")
 		return
 	}
 	var body struct {
@@ -609,7 +643,7 @@ func (s *Server) createInvite(c *gin.Context) {
 	if !ok {
 		return
 	}
-	guildID, _, ok := s.guildRole(c, u.ID, guilds.RoleAdmin)
+	guildID, _, ok := s.guildAccess(c, u.ID, guilds.PermCreateInvite)
 	if !ok {
 		return
 	}
