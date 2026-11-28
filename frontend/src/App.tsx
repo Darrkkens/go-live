@@ -1,6 +1,10 @@
 import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent, type KeyboardEvent } from 'react'
 import './App.css'
 import { callIcons, callSummary, type CallInfo, type CallJoin, type CallRecord } from './callUtils'
+import { apiBase, avatarSource, request } from './api'
+import { AddMembersDialog, AddServerDialog, ChannelDialog, ConfirmDialog, GuildSettingsDialog, GuildSidebar, InviteDialog, InvitePreviewDialog, MemberList, ServerRail, type GuildAction, type MemberAction } from './guilds'
+import type { Channel, GuildDetail, GuildSummary, Member, VoiceMember } from './guildTypes'
+import { applyTheme, savedTheme, watchSystemTheme, type ThemePref } from './theme'
 
 type User = {
   id: string
@@ -16,16 +20,16 @@ type Toast = { kind: 'success' | 'error'; message: string }
 type Contact = Pick<User, 'id' | 'avatar' | 'username' | 'userTag' | 'status'>
 type Panel = 'chat' | 'profile' | 'admin'
 type Attachment = { kind: 'image' | 'file'; url: string; contentType: string; name: string; size: number; width?: number; height?: number }
-type Message = { id: number; senderId: string; recipientId: string; body: string; attachment: Attachment | null; createdAt: string; readAt: string | null; editedAt: string | null; deletedAt: string | null; call: CallRecord | null }
+type Message = { id: number; senderId: string; recipientId?: string; channelId?: string; body: string; attachment: Attachment | null; createdAt: string; readAt: string | null; editedAt: string | null; deletedAt: string | null; call: CallRecord | null }
 type PendingAttachment = { contactId: string; file: File; kind: 'image' | 'file'; preview: string | null }
 type Conversation = { contactId: string; lastMessage: Message; unread: number }
 type Thread = { messages: Message[]; hasMore: boolean; loaded: boolean }
-type RealtimeEvent = { type: 'message' | 'message_updated'; message: Message } | { type: 'read'; readerId: string; readAt: string } | { type: 'presence'; userId: string; status: User['status'] } | { type: 'call'; call: CallInfo }
+type RealtimeEvent = { type: 'message' | 'message_updated'; message: Message } | { type: 'read'; readerId: string; readAt: string } | { type: 'presence'; userId: string; status: User['status'] } | { type: 'call'; call: CallInfo } | { type: 'guild'; guildId: string; action: 'updated' | 'removed' } | { type: 'voice'; guildId: string; channelId: string; members: VoiceMember[] }
 
-const apiBase = `http://localhost:${import.meta.env.VITE_PORT || '8081'}`
 // The LiveKit client is large, so the call UI loads on first use.
 const CallScreen = lazy(() => import('./calls').then((m) => ({ default: m.CallScreen })))
 const IncomingCall = lazy(() => import('./calls').then((m) => ({ default: m.IncomingCall })))
+const VoiceScreen = lazy(() => import('./calls').then((m) => ({ default: m.VoiceScreen })))
 
 const realtimeUrl = `${apiBase.replace(/^http/, 'ws')}/api/ws`
 const pageSize = 50
@@ -124,10 +128,10 @@ function bubbleImageSize(a: Attachment) {
   return { width: Math.max(80, Math.round(width * scale)), height: Math.max(60, Math.round(height * scale)) }
 }
 
-function uploadAttachment(contactId: string, file: File, caption: string, onProgress: (fraction: number) => void) {
+function uploadAttachment(key: string, file: File, caption: string, onProgress: (fraction: number) => void) {
   return new Promise<Message>((resolve, reject) => {
     const xhr = new XMLHttpRequest()
-    xhr.open('POST', `${apiBase}/api/conversations/${contactId}/attachments`)
+    xhr.open('POST', `${apiBase}${convPath(key)}/attachments`)
     xhr.withCredentials = true
     xhr.responseType = 'json'
     xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress(event.loaded / event.total) }
@@ -139,7 +143,6 @@ function uploadAttachment(contactId: string, file: File, caption: string, onProg
     xhr.send(data)
   })
 }
-const avatarSource = (path: string) => path.startsWith('/api/avatars/') ? `${apiBase}${path}` : path
 
 function mergeMessages(current: Message[], incoming: Message[]) {
   const byId = new Map(current.map((m) => [m.id, m]))
@@ -177,17 +180,9 @@ function ReadTicks({ message }: { message: Message }) {
   )
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${apiBase}${path}`, {
-    ...init,
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
-  })
-  if (!response.ok) {
-    const result = await response.json().catch(() => ({}))
-    throw new Error(result.error || `Erro HTTP ${response.status}`)
-  }
-  return response.status === 204 ? undefined as T : response.json()
+/** Conversation keys: a contact id for direct messages, "ch:<id>" for a server channel. */
+function convPath(key: string) {
+  return key.startsWith('ch:') ? `/api/channels/${key.slice(3)}` : `/api/conversations/${key}`
 }
 
 function App() {
@@ -207,6 +202,7 @@ function App() {
   const [dragging, setDragging] = useState(false)
   const [status, setStatus] = useState<User['status']>('offline')
   const [statusSaving, setStatusSaving] = useState(false)
+  const [themePref, setThemePref] = useState<ThemePref>(savedTheme)
   const [avatarUploading, setAvatarUploading] = useState(false)
   const [passwordOpen, setPasswordOpen] = useState(false)
   const [confirmPassword, setConfirmPassword] = useState('')
@@ -232,6 +228,25 @@ function App() {
   const [callBusy, setCallBusy] = useState(false)
   const [callDockEl, setCallDockEl] = useState<HTMLDivElement | null>(null)
   const [callMiniEl, setCallMiniEl] = useState<HTMLDivElement | null>(null)
+  const [guilds, setGuilds] = useState<GuildSummary[]>([])
+  const [guildDetails, setGuildDetails] = useState<Record<string, GuildDetail>>({})
+  // null shows direct messages; otherwise the open server.
+  const [selectedGuildId, setSelectedGuildId] = useState<string | null>(null)
+  const [channelByGuild, setChannelByGuild] = useState<Record<string, string>>({})
+  const [channelUnread, setChannelUnread] = useState<Record<string, number>>({})
+  const [mobileChannelOpen, setMobileChannelOpen] = useState(false)
+  const [showMembers, setShowMembers] = useState(true)
+  const [guildDialog, setGuildDialog] = useState<{ kind: 'add-server' } | { kind: 'invite-preview'; code: string } | { kind: GuildAction } | { kind: 'channel'; channel: Channel | null; voice?: boolean } | { kind: 'confirm'; title: string; text: string; action: string; run: () => Promise<void> } | null>(null)
+  const [pendingInvite, setPendingInvite] = useState<string | null>(() => window.location.pathname.match(/^\/convite\/([A-Za-z0-9]{6,16})\/?$/)?.[1] ?? null)
+  const channelGuildRef = useRef<Record<string, string>>({})
+  type VoiceJoin = { channelId: string; guildId: string; url: string; token: string }
+  const [activeVoice, setActiveVoice] = useState<VoiceJoin | null>(null)
+  const [voiceByChannel, setVoiceByChannel] = useState<Record<string, VoiceMember[]>>({})
+  const [speakingIds, setSpeakingIds] = useState<string[]>([])
+  const [voiceDockEl, setVoiceDockEl] = useState<HTMLDivElement | null>(null)
+  const [voiceBusy, setVoiceBusy] = useState(false)
+  const activeVoiceRef = useRef<VoiceJoin | null>(null)
+  useLayoutEffect(() => { activeVoiceRef.current = activeVoice })
   const activeCallRef = useRef<string | null>(null)
   useLayoutEffect(() => { activeCallRef.current = activeCall?.call.id ?? null })
   const deleteCancelRef = useRef<HTMLButtonElement>(null)
@@ -251,12 +266,25 @@ function App() {
   useLayoutEffect(() => {
     userIdRef.current = user?.id ?? null
     contactsRef.current = contacts
-    selectedRef.current = panel === 'chat' ? selectedContactId : null
   })
+
+  useEffect(() => {
+    applyTheme(themePref)
+    if (themePref !== 'system') return
+    return watchSystemTheme(() => applyTheme('system'))
+  }, [themePref])
 
   function notify(kind: Toast['kind'], message: string) {
     setToast({ kind, message })
   }
+
+  const selectedGuild = selectedGuildId ? guildDetails[selectedGuildId] : undefined
+  const guildTextChannels = selectedGuild?.channels.filter((c) => c.kind === 'text') ?? []
+  const selectedChannel = selectedGuild ? selectedGuild.channels.find((c) => c.id === channelByGuild[selectedGuild.id]) ?? guildTextChannels[0] : undefined
+  const isVoiceView = selectedChannel?.kind === 'voice'
+  const activeKey = selectedGuildId ? (selectedChannel && !isVoiceView ? `ch:${selectedChannel.id}` : null) : selectedContactId
+  const activeChannelId = selectedChannel && !isVoiceView ? selectedChannel.id : null
+  useLayoutEffect(() => { selectedRef.current = panel === 'chat' ? activeKey : null })
 
   useEffect(() => {
     if (!toast) return
@@ -282,18 +310,32 @@ function App() {
     request<Contact[]>('/api/contacts').then(setContacts).catch((err: Error) => notify('error', err.message))
   }, [user?.id])
 
+  const loadGuilds = useCallback(() => {
+    request<GuildSummary[]>('/api/guilds').then(setGuilds).catch((err: Error) => notify('error', err.message))
+  }, [])
+
+  const loadGuild = useCallback(async (id: string) => {
+    try {
+      const detail = await request<GuildDetail>(`/api/guilds/${id}`)
+      for (const c of detail.channels) channelGuildRef.current[c.id] = id
+      setGuildDetails((all) => ({ ...all, [id]: detail }))
+      setChannelUnread((all) => ({ ...all, ...Object.fromEntries(detail.channels.map((c) => [c.id, detail.unread[c.id] ?? 0])) }))
+      setVoiceByChannel((all) => ({ ...all, ...Object.fromEntries(detail.channels.filter((c) => c.kind === 'voice').map((c) => [c.id, detail.voice?.[c.id] ?? []])) }))
+    } catch (err) { notify('error', (err as Error).message) }
+  }, [])
+
   const loadConversations = useCallback(() => {
     request<Conversation[]>('/api/conversations')
       .then((list) => setConversations(Object.fromEntries(list.map((c) => [c.contactId, c]))))
       .catch((err: Error) => notify('error', err.message))
   }, [])
 
-  const loadThread = useCallback(async (contactId: string) => {
+  const loadThread = useCallback(async (key: string) => {
     try {
-      const list = await request<Message[]>(`/api/conversations/${contactId}/messages?limit=${pageSize}`)
+      const list = await request<Message[]>(`${convPath(key)}/messages?limit=${pageSize}`)
       setThreads((all) => {
-        const previous = all[contactId]
-        return { ...all, [contactId]: { messages: mergeMessages(previous?.messages ?? [], list), hasMore: previous?.loaded ? previous.hasMore : list.length === pageSize, loaded: true } }
+        const previous = all[key]
+        return { ...all, [key]: { messages: mergeMessages(previous?.messages ?? [], list), hasMore: previous?.loaded ? previous.hasMore : list.length === pageSize, loaded: true } }
       })
     } catch (err) { notify('error', (err as Error).message) }
   }, [])
@@ -301,12 +343,20 @@ function App() {
   const applyUpdate = useCallback((message: Message) => {
     const me = userIdRef.current
     if (!me) return
-    const contactId = message.senderId === me ? message.recipientId : message.senderId
+    const contactId = message.channelId ? `ch:${message.channelId}` : message.senderId === me ? message.recipientId! : message.senderId
     setThreads((all) => {
       const thread = all[contactId]
       if (!thread) return all
       return { ...all, [contactId]: { ...thread, messages: thread.messages.map((m) => m.id === message.id ? message : m) } }
     })
+    if (message.channelId) {
+      if (message.deletedAt) {
+        setLightbox((current) => current?.id === message.id ? null : current)
+        setEditing((current) => current?.message.id === message.id ? null : current)
+        setConfirmDelete((current) => current?.id === message.id ? null : current)
+      }
+      return
+    }
     setConversations((all) => {
       const current = all[contactId]
       if (!current) return all
@@ -322,6 +372,25 @@ function App() {
       setConfirmDelete((current) => current?.id === message.id ? null : current)
     }
   }, [loadConversations])
+
+  const guildDetailsRef = useRef<Record<string, GuildDetail>>({})
+  const selectedGuildRef = useRef<string | null>(null)
+  useLayoutEffect(() => { guildDetailsRef.current = guildDetails; selectedGuildRef.current = selectedGuildId })
+
+  const handleGuildEvent = useCallback((guildId: string, action: 'updated' | 'removed') => {
+    loadGuilds()
+    if (action === 'updated') {
+      if (guildDetailsRef.current[guildId]) void loadGuild(guildId)
+      return
+    }
+    const name = guildDetailsRef.current[guildId]?.name
+    setGuildDetails((all) => { const next = { ...all }; delete next[guildId]; return next })
+    if (activeVoiceRef.current?.guildId === guildId) setActiveVoice(null)
+    if (selectedGuildRef.current === guildId) {
+      setSelectedGuildId(null)
+      notify('error', name ? `Você não faz mais parte de ${name}.` : 'Você não faz mais parte deste servidor.')
+    }
+  }, [loadGuilds, loadGuild])
 
   const contactName = useCallback((id: string) => contactsRef.current.find((c) => c.id === id)?.username ?? 'O contato', [])
 
@@ -352,19 +421,25 @@ function App() {
   const receive = useCallback((message: Message) => {
     const me = userIdRef.current
     if (!me) return
-    const contactId = message.senderId === me ? message.recipientId : message.senderId
+    const contactId = message.channelId ? `ch:${message.channelId}` : message.senderId === me ? message.recipientId! : message.senderId
     setThreads((all) => all[contactId] ? { ...all, [contactId]: { ...all[contactId], messages: mergeMessages(all[contactId].messages, [message]) } } : all)
+    if (message.channelId) {
+      const channelId = message.channelId
+      if (message.senderId !== me) setChannelUnread((all) => ({ ...all, [channelId]: (all[channelId] ?? 0) + 1 }))
+      // A channel of a server not opened yet: refresh the rail's unread dots.
+      if (!channelGuildRef.current[channelId]) loadGuilds()
+      return
+    }
     setConversations((all) => {
       const current = all[contactId]
       if (current && current.lastMessage.id >= message.id) return all
       const isNewIncoming = message.senderId === contactId && !message.readAt && (!message.call || message.call.status === 'missed')
       return { ...all, [contactId]: { contactId, lastMessage: message, unread: (current?.unread ?? 0) + (isNewIncoming ? 1 : 0) } }
     })
-  }, [])
+  }, [loadGuilds])
 
   useEffect(() => {
     if (!user?.id) return
-    loadConversations()
     let socket: WebSocket | null = null
     let retry = 0
     let timer: number | undefined
@@ -373,8 +448,11 @@ function App() {
       socket = new WebSocket(realtimeUrl)
       socket.onopen = () => {
         setConnected(true)
+        // Reload on every open: events sent before the socket was ready would be lost.
+        loadConversations()
+        loadGuilds()
+        for (const id of Object.keys(guildDetailsRef.current)) void loadGuild(id)
         if (retry > 0) {
-          loadConversations()
           request<Contact[]>('/api/contacts').then(setContacts).catch(() => {})
           if (selectedRef.current) void loadThread(selectedRef.current)
         }
@@ -386,6 +464,14 @@ function App() {
         if (data.type === 'message') receive(data.message)
         if (data.type === 'message_updated') applyUpdate(data.message)
         if (data.type === 'call') handleCallEvent(data.call)
+        if (data.type === 'guild') handleGuildEvent(data.guildId, data.action)
+        if (data.type === 'voice') {
+          const { channelId, members } = data
+          setVoiceByChannel((all) => ({ ...all, [channelId]: members }))
+          // Removed by the server (kicked, channel deleted, joined elsewhere in another tab).
+          const me = userIdRef.current
+          if (activeVoiceRef.current?.channelId === channelId && me && !members.some((m) => m.userId === me)) setActiveVoice(null)
+        }
         if (data.type === 'presence') {
           const { userId, status } = data
           setContacts((list) => list.map((contact) => contact.id === userId ? { ...contact, status } : contact))
@@ -405,7 +491,7 @@ function App() {
     }
     connect()
     return () => { stopped = true; window.clearTimeout(timer); socket?.close() }
-  }, [user?.id, loadConversations, loadThread, receive, applyUpdate, handleCallEvent])
+  }, [user?.id, loadConversations, loadThread, receive, applyUpdate, handleCallEvent, loadGuilds, loadGuild, handleGuildEvent])
 
   useEffect(() => {
     const onVisibility = () => setVisible(document.visibilityState === 'visible')
@@ -414,23 +500,37 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (!selectedContactId || panel !== 'chat') return
-    stickToBottom.current = true
-    if (!threads[selectedContactId]?.loaded) void loadThread(selectedContactId)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedContactId, panel, loadThread])
-
-  const openThread = selectedContactId && panel === 'chat' ? threads[selectedContactId] : undefined
-  const hasUnreadOpen = !!selectedContactId && !!openThread?.messages.some((m) => m.senderId === selectedContactId && !m.readAt)
+    if (selectedGuildId && !guildDetails[selectedGuildId]) void loadGuild(selectedGuildId)
+  }, [selectedGuildId, guildDetails, loadGuild])
 
   useEffect(() => {
-    if (!selectedContactId || !hasUnreadOpen || !visible) return
-    const contactId = selectedContactId
+    if (!activeKey || panel !== 'chat') return
+    stickToBottom.current = true
+    if (!threads[activeKey]?.loaded) void loadThread(activeKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeKey, panel, loadThread])
+
+  const openThread = activeKey && panel === 'chat' ? threads[activeKey] : undefined
+  const dmKey = activeKey && !activeKey.startsWith('ch:') ? activeKey : null
+  const hasUnreadOpen = !!dmKey && !!openThread?.messages.some((m) => m.senderId === dmKey && !m.readAt)
+  const openChannelUnread = activeChannelId && panel === 'chat' ? channelUnread[activeChannelId] ?? 0 : 0
+
+  // An open, visible channel counts as read.
+  useEffect(() => {
+    if (!activeChannelId || !openChannelUnread || !visible) return
+    const id = activeChannelId
+    setChannelUnread((all) => ({ ...all, [id]: 0 }))
+    request<void>(`/api/channels/${id}/read`, { method: 'POST' }).catch(() => {})
+  }, [activeChannelId, openChannelUnread, visible])
+
+  useEffect(() => {
+    if (!dmKey || !hasUnreadOpen || !visible) return
+    const contactId = dmKey
     const now = new Date().toISOString()
     setThreads((all) => all[contactId] ? { ...all, [contactId]: { ...all[contactId], messages: all[contactId].messages.map((m) => m.senderId === contactId && !m.readAt ? { ...m, readAt: now } : m) } } : all)
     setConversations((all) => all[contactId] ? { ...all, [contactId]: { ...all[contactId], unread: 0 } } : all)
     request<void>(`/api/conversations/${contactId}/read`, { method: 'POST' }).catch(() => {})
-  }, [selectedContactId, hasUnreadOpen, visible])
+  }, [dmKey, hasUnreadOpen, visible])
 
   useLayoutEffect(() => {
     const canvas = canvasRef.current
@@ -444,11 +544,11 @@ function App() {
   }, [openThread?.messages])
 
   async function loadOlder() {
-    if (!selectedContactId || !openThread?.messages.length) return
-    const contactId = selectedContactId
+    if (!activeKey || !openThread?.messages.length) return
+    const contactId = activeKey
     setLoadingOlder(true)
     try {
-      const list = await request<Message[]>(`/api/conversations/${contactId}/messages?limit=${pageSize}&before=${openThread.messages[0].id}`)
+      const list = await request<Message[]>(`${convPath(contactId)}/messages?limit=${pageSize}&before=${openThread.messages[0].id}`)
       olderAnchor.current = canvasRef.current ? canvasRef.current.scrollHeight - canvasRef.current.scrollTop : null
       setThreads((all) => ({ ...all, [contactId]: { messages: mergeMessages(all[contactId]?.messages ?? [], list), hasMore: list.length === pageSize, loaded: true } }))
     } catch (err) { notify('error', (err as Error).message) }
@@ -456,7 +556,7 @@ function App() {
   }
 
   function attachFile(file?: File | null) {
-    if (!file || !selectedContactId) return
+    if (!file || !activeKey) return
     const isImage = imageTypes.includes(file.type)
     if (!isImage && !documentExtensions.includes(fileExtension(file.name))) {
       notify('error', 'Tipo de arquivo não permitido. Envie imagens, PDF, documentos do Office/LibreOffice, TXT, CSV, MD, ZIP, RAR ou 7z.'); return
@@ -466,7 +566,7 @@ function App() {
     if (file.size === 0) { notify('error', 'O arquivo está vazio.'); return }
     setPending((current) => {
       if (current?.preview) URL.revokeObjectURL(current.preview)
-      return { contactId: selectedContactId, file, kind: isImage ? 'image' : 'file', preview: isImage ? URL.createObjectURL(file) : null }
+      return { contactId: activeKey, file, kind: isImage ? 'image' : 'file', preview: isImage ? URL.createObjectURL(file) : null }
     })
     composerRef.current?.focus()
   }
@@ -490,7 +590,7 @@ function App() {
   }
 
   useEffect(() => {
-    if (!selectedContactId || panel !== 'chat') return
+    if (!activeKey || panel !== 'chat') return
     const onPaste = (event: ClipboardEvent) => {
       const file = fileFromClipboard(event.clipboardData)
       if (!file) return
@@ -509,7 +609,7 @@ function App() {
     if (!dragHasFiles(event)) return
     event.preventDefault()
     dragDepth.current = 0; setDropActive(false)
-    if (!selectedContactId || panel !== 'chat') return
+    if (!activeKey || panel !== 'chat') return
     if (event.dataTransfer.files.length > 1) notify('error', 'Envie um arquivo por vez; o primeiro foi selecionado.')
     attachFile(event.dataTransfer.files[0])
   }
@@ -538,9 +638,35 @@ function App() {
     return () => window.clearTimeout(timer)
   }, [user?.id])
 
+  useEffect(() => {
+    if (!user?.id) return
+    request<VoiceJoin | { channelId: null }>('/api/voice/current').then((res) => { if (res.channelId) setActiveVoice(res as VoiceJoin) }).catch(() => {})
+  }, [user?.id])
+
+  async function joinVoice(channel: Channel) {
+    if (activeVoice?.channelId === channel.id || voiceBusy) return
+    if (activeCall) { notify('error', 'Encerre a ligação atual antes de entrar em um canal de voz.'); return }
+    setVoiceBusy(true)
+    try {
+      const res = await request<VoiceJoin>(`/api/channels/${channel.id}/voice/join`, { method: 'POST' })
+      setActiveVoice(res)
+    } catch (err) { notify('error', (err as Error).message) }
+    finally { setVoiceBusy(false) }
+  }
+
+  async function leaveVoice() {
+    setActiveVoice(null)
+    await request<void>('/api/voice/leave', { method: 'POST' }).catch(() => {})
+  }
+
+  const reportVoiceState = useCallback((state: { muted: boolean; deafened: boolean; video: boolean; screen: boolean }) => {
+    request<void>('/api/voice/state', { method: 'POST', body: JSON.stringify(state) }).catch(() => {})
+  }, [])
+
   async function startCall(media: 'audio' | 'video') {
     if (!selectedContactId || callBusy) return
     if (activeCall) { notify('error', 'Você já está em uma ligação.'); return }
+    if (activeVoice) { notify('error', 'Saia do canal de voz antes de ligar.'); return }
     setCallBusy(true)
     try {
       const res = await request<CallJoin & { unavailable?: string; message?: string }>('/api/calls', { method: 'POST', body: JSON.stringify({ contactId: selectedContactId, media }) })
@@ -578,9 +704,9 @@ function App() {
   }
 
   function startEdit(message: Message) {
-    if (!selectedContactId) return
+    if (!activeKey) return
     setMenu(null)
-    setEditing({ contactId: selectedContactId, message })
+    setEditing({ contactId: activeKey, message })
     setEditDraft(message.body)
     window.requestAnimationFrame(() => { const field = composerRef.current; if (field) { field.focus(); field.setSelectionRange(field.value.length, field.value.length) } })
   }
@@ -657,21 +783,21 @@ function App() {
 
   useEffect(() => {
     setMenu(null)
-    setEditing((current) => current && current.contactId !== selectedContactId ? null : current)
-  }, [selectedContactId, panel])
+    setEditing((current) => current && current.contactId !== activeKey ? null : current)
+  }, [activeKey, panel])
 
   async function sendMessage(event?: FormEvent) {
     event?.preventDefault()
-    if (!selectedContactId || sending) return
-    if (editing?.contactId === selectedContactId) { await saveEdit(); return }
-    const contactId = selectedContactId
+    if (!activeKey || sending) return
+    if (editing?.contactId === activeKey) { await saveEdit(); return }
+    const contactId = activeKey
     if (pending?.contactId === contactId) { await sendPending(contactId, pending); return }
     const body = (drafts[contactId] ?? '').trim()
     if (!body) return
     if (body.length > maxMessageLength) { notify('error', `A mensagem pode ter até ${maxMessageLength} caracteres.`); return }
     setSending(true)
     try {
-      const message = await request<Message>(`/api/conversations/${contactId}/messages`, { method: 'POST', body: JSON.stringify({ body }) })
+      const message = await request<Message>(`${convPath(contactId)}/messages`, { method: 'POST', body: JSON.stringify({ body }) })
       stickToBottom.current = true
       setDrafts((all) => ({ ...all, [contactId]: '' }))
       receive(message)
@@ -687,23 +813,25 @@ function App() {
       cancelEdit()
     } else if (event.key === 'Escape' && pending && !sending) {
       discardPending()
-    } else if (event.key === 'ArrowUp' && !editing && !pending && !event.currentTarget.value && selectedContactId && user) {
-      const last = [...(threads[selectedContactId]?.messages ?? [])].reverse().find((m) => m.senderId === user.id && !m.deletedAt)
+    } else if (event.key === 'ArrowUp' && !editing && !pending && !event.currentTarget.value && activeKey && user) {
+      const last = [...(threads[activeKey]?.messages ?? [])].reverse().find((m) => m.senderId === user.id && !m.deletedAt)
       if (last && changeTimeLeft(last) > 0) { event.preventDefault(); startEdit(last) }
     }
   }
 
   function clearSession() {
     setUser(null); setUsers([]); setContacts([]); setSelectedContactId(null); setPanel('chat')
-    setConversations({}); setThreads({}); setDrafts({}); discardPending(); setLightbox(null); setEditing(null); setMenu(null); setConfirmDelete(null); setActiveCall(null); setIncomingCall(null)
+    setGuilds([]); setGuildDetails({}); setSelectedGuildId(null); setChannelUnread({}); setGuildDialog(null)
+    setConversations({}); setThreads({}); setDrafts({}); discardPending(); setLightbox(null); setEditing(null); setMenu(null); setConfirmDelete(null); setActiveCall(null); setIncomingCall(null); setActiveVoice(null); setVoiceByChannel({})
   }
 
   useLayoutEffect(() => {
     const field = composerRef.current
-    if (!field) return
+    // A hidden composer (mobile, before the chat opens) measures 0; size it once visible.
+    if (!field || !field.offsetParent) return
     field.style.height = 'auto'
     field.style.height = `${Math.min(field.scrollHeight, 140)}px`
-  }, [drafts, selectedContactId])
+  }, [drafts, editDraft, activeKey, mobileChannelOpen, panel])
 
   async function login(event: FormEvent) {
     event.preventDefault()
@@ -803,12 +931,88 @@ function App() {
     } catch (err) { notify('error', (err as Error).message) }
   }
 
-  const selectedContact = contacts.find((contact) => contact.id === selectedContactId)
+  // Invite links (/convite/CODE) open a preview once logged in.
+  useEffect(() => {
+    if (!user || !pendingInvite) return
+    setGuildDialog({ kind: 'invite-preview', code: pendingInvite })
+    setPendingInvite(null)
+    window.history.replaceState(null, '', '/')
+  }, [user, pendingInvite])
+
+  function openGuild(id: string | null) {
+    setSelectedGuildId(id); setPanel('chat'); setMobileChannelOpen(false)
+    if (id) loadGuilds()
+  }
+
+  function selectChannel(id: string) {
+    if (!selectedGuildId) return
+    setChannelByGuild((all) => ({ ...all, [selectedGuildId]: id })); setPanel('chat'); setMobileChannelOpen(true)
+    // Clicking a voice channel joins it, like Discord.
+    const channel = guildDetails[selectedGuildId]?.channels.find((c) => c.id === id)
+    if (channel?.kind === 'voice') void joinVoice(channel)
+  }
+
+  function openVoiceView() {
+    if (!activeVoice) return
+    setSelectedGuildId(activeVoice.guildId)
+    setChannelByGuild((all) => ({ ...all, [activeVoice.guildId]: activeVoice.channelId })); setPanel('chat'); setMobileChannelOpen(true)
+  }
+
+  async function joinedGuild(id: string) {
+    setGuildDialog(null); loadGuilds(); await loadGuild(id); openGuild(id)
+  }
+
+  function guildAction(action: GuildAction) {
+    if (!selectedGuild) return
+    if (action === 'create-channel' || action === 'create-voice') { setGuildDialog({ kind: 'channel', channel: null, voice: action === 'create-voice' }); return }
+    if (action === 'leave') {
+      const g = selectedGuild
+      setGuildDialog({ kind: 'confirm', title: `Sair de ${g.name}?`, text: 'Você deixa de ver os canais e só volta com um novo convite.', action: 'Sair do servidor', run: async () => {
+        try {
+          await request<void>(`/api/guilds/${g.id}/leave`, { method: 'POST' })
+          setGuildDialog(null); openGuild(null); loadGuilds(); notify('success', `Você saiu de ${g.name}.`)
+        } catch (err) { notify('error', (err as Error).message) }
+      } })
+      return
+    }
+    setGuildDialog({ kind: action })
+  }
+
+  function memberAction(member: Member, action: MemberAction) {
+    if (!selectedGuild) return
+    const g = selectedGuild
+    if (action === 'message') { openGuild(null); setSelectedContactId(member.userId); return }
+    if (action === 'kick') {
+      setGuildDialog({ kind: 'confirm', title: `Remover ${member.username}?`, text: `${member.username} sai de ${g.name} e só volta com um novo convite.`, action: 'Remover do servidor', run: async () => {
+        try { await request<void>(`/api/guilds/${g.id}/members/${member.userId}`, { method: 'DELETE' }); setGuildDialog(null); notify('success', `${member.username} foi removido.`) }
+        catch (err) { notify('error', (err as Error).message) }
+      } })
+      return
+    }
+    request<void>(`/api/guilds/${g.id}/members/${member.userId}`, { method: 'PATCH', body: JSON.stringify({ role: action === 'make-admin' ? 'admin' : 'member' }) })
+      .then(() => notify('success', action === 'make-admin' ? `${member.username} agora é admin.` : `${member.username} não é mais admin.`))
+      .catch((err: Error) => notify('error', err.message))
+  }
+
+  const contactStatus = new Map(contacts.map((c) => [c.id, c.status]))
+  const statusOf = (m: Member) => m.userId === user?.id ? status : contactStatus.get(m.userId) ?? m.status
+  const guildHasUnread = (id: string) => {
+    const detail = guildDetails[id]
+    if (!detail) return (guilds.find((g) => g.id === id)?.unread ?? 0) > 0
+    return detail.channels.some((c) => (channelUnread[c.id] ?? 0) > 0 && c.id !== activeChannelId)
+  }
+  const dmUnread = Object.values(conversations).reduce((sum, c) => sum + c.unread, 0)
+  const memberById = new Map((selectedGuild?.members ?? []).map((m) => [m.userId, m]))
+  const isChannel = !!selectedChannel && !!selectedGuildId && !isVoiceView
+
+  const selectedContact = selectedGuildId ? undefined : contacts.find((contact) => contact.id === selectedContactId)
+  const conv = isChannel && selectedChannel ? { key: `ch:${selectedChannel.id}`, label: `#${selectedChannel.name}` } : selectedContact ? { key: selectedContact.id, label: selectedContact.username } : null
+  const mobileMainOpen = panel !== 'chat' || (selectedGuildId ? mobileChannelOpen : !!selectedContact)
   const filteredContacts = contacts
     .filter((contact) => `${contact.username} ${contact.userTag}`.toLocaleLowerCase().includes(search.toLocaleLowerCase()))
     .sort((a, b) => (conversations[b.id]?.lastMessage.id ?? 0) - (conversations[a.id]?.lastMessage.id ?? 0))
-  const draft = selectedContactId ? drafts[selectedContactId] ?? '' : ''
-  const isEditing = !!editing && editing.contactId === selectedContactId
+  const draft = activeKey ? drafts[activeKey] ?? '' : ''
+  const isEditing = !!editing && editing.contactId === activeKey
   const composerValue = isEditing ? editDraft : draft
 
   return (
@@ -829,7 +1033,12 @@ function App() {
         </>
       ) : (
         <>
-          <aside className={`chat-sidebar ${selectedContact && panel === 'chat' || panel !== 'chat' ? 'mobile-hidden' : ''}`} aria-label="Conversas">
+          <div className={`nav-column ${mobileMainOpen ? 'mobile-hidden' : ''}`}>
+          <ServerRail guilds={guilds} selectedId={selectedGuildId} hasUnread={guildHasUnread} dmUnread={dmUnread} onSelect={openGuild} onAdd={() => setGuildDialog({ kind: 'add-server' })} />
+          <aside className="chat-sidebar" aria-label={selectedGuild ? `Canais de ${selectedGuild.name}` : 'Conversas'}>
+            {selectedGuildId ? (selectedGuild ? (
+              <GuildSidebar guild={selectedGuild} selectedChannelId={selectedChannel?.id ?? null} unread={channelUnread} voice={voiceByChannel} connectedVoiceId={activeVoice?.channelId ?? null} speaking={speakingIds} onSelectChannel={selectChannel} onAction={guildAction} onEditChannel={(channel) => setGuildDialog({ kind: 'channel', channel })} />
+            ) : <p className="sidebar-empty">Carregando servidor…</p>) : (<>
             <div className="sidebar-search">
               <button className="icon-button" type="button" aria-label="Abrir perfil" title="Abrir perfil" onClick={() => setPanel(panel === 'profile' ? 'chat' : 'profile')}><img src="/figma-chat/menu.svg" alt="" /></button>
               <label className="search-box"><img src="/figma-chat/search.svg" alt="" /><span className="sr-only">Buscar contatos</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar" /></label>
@@ -849,6 +1058,7 @@ function App() {
                 </button>
               )) : <p className="sidebar-empty">{search ? 'Nenhum contato encontrado.' : 'Ainda não há outros usuários ativos.'}</p>}
             </div>
+            </>)}
             <div ref={setCallMiniEl} />
             <div className="sidebar-footer">
               <button className="account-shortcut" type="button" onClick={() => setPanel('profile')}>
@@ -856,17 +1066,45 @@ function App() {
                 <span><strong>{user.username}</strong><small>@{user.userTag}</small></span>
               </button>
               {user.role === 'master' && <button className="admin-shortcut" type="button" onClick={() => setPanel('admin')}>Admin</button>}
+              <button className={`footer-gear ${panel === 'profile' ? 'active' : ''}`} type="button" onClick={() => setPanel(panel === 'profile' ? 'chat' : 'profile')} aria-label="Configurações do perfil" title="Configurações do perfil">
+                <CallIcon path="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" size={20} />
+              </button>
             </div>
           </aside>
-          <section className={`chat-main ${selectedContact && panel === 'chat' || panel !== 'chat' ? 'mobile-open' : ''}`}
-            onDragEnter={(e) => { if (!dragHasFiles(e) || !selectedContact || panel !== 'chat') return; e.preventDefault(); dragDepth.current += 1; setDropActive(true) }}
-            onDragOver={(e) => { if (dragHasFiles(e) && selectedContact && panel === 'chat') { e.preventDefault(); e.dataTransfer.dropEffect = 'copy' } }}
+          </div>
+          <section className={`chat-main ${mobileMainOpen ? 'mobile-open' : ''}`}
+            onDragEnter={(e) => { if (!dragHasFiles(e) || !conv || panel !== 'chat') return; e.preventDefault(); dragDepth.current += 1; setDropActive(true) }}
+            onDragOver={(e) => { if (dragHasFiles(e) && conv && panel === 'chat') { e.preventDefault(); e.dataTransfer.dropEffect = 'copy' } }}
             onDragLeave={(e) => { if (!dragHasFiles(e)) return; dragDepth.current = Math.max(0, dragDepth.current - 1); if (dragDepth.current === 0) setDropActive(false) }}
             onDrop={dropFile}>
             {panel === 'chat' ? (
               <>
-                {selectedContact ? (
+                {isVoiceView && selectedChannel && selectedGuild ? (
                   <>
+                    <header className="conversation-header channel-header">
+                      <button className="mobile-back" type="button" onClick={() => setMobileChannelOpen(false)} aria-label="Voltar aos canais">‹</button>
+                      <span className="channel-header-hash" aria-hidden="true"><CallIcon path="M11 5 6 9H2v6h4l5 4V5ZM15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14" size={22} /></span>
+                      <div className="conversation-identity"><strong>{selectedChannel.name}</strong><small>{(voiceByChannel[selectedChannel.id] ?? []).length} no canal de voz</small></div>
+                    </header>
+                    {activeVoice?.channelId === selectedChannel.id ? <div className="call-dock voice-dock" ref={setVoiceDockEl} /> : (
+                      <div className="voice-join">
+                        <span className="voice-join-icon"><CallIcon path="M11 5 6 9H2v6h4l5 4V5ZM15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14" size={34} /></span>
+                        <h1>{selectedChannel.name}</h1>
+                        <p>{(voiceByChannel[selectedChannel.id] ?? []).length ? `${(voiceByChannel[selectedChannel.id] ?? []).map((v) => memberById.get(v.userId)?.username ?? 'Membro').join(', ')} ${(voiceByChannel[selectedChannel.id] ?? []).length === 1 ? 'está' : 'estão'} conversando.` : 'Ninguém está aqui agora.'}</p>
+                        <button type="button" className="primary-button" onClick={() => joinVoice(selectedChannel)} disabled={voiceBusy}>{voiceBusy ? 'Entrando…' : 'Entrar no canal de voz'}</button>
+                      </div>
+                    )}
+                  </>
+                ) : conv ? (
+                  <>
+                    {isChannel && selectedChannel && selectedGuild ? (
+                      <header className="conversation-header channel-header">
+                        <button className="mobile-back" type="button" onClick={() => setMobileChannelOpen(false)} aria-label="Voltar aos canais">‹</button>
+                        <span className="channel-header-hash" aria-hidden="true"><CallIcon path="M5 9h14M5 15h14M10 3 8 21M16 3l-2 18" size={22} /></span>
+                        <div className="conversation-identity"><strong>{selectedChannel.name}</strong>{(selectedChannel.topic || !connected) && <small>{connected ? selectedChannel.topic : 'Reconectando…'}</small>}</div>
+                        <button className={`icon-button header-action members-toggle ${showMembers ? 'active' : ''}`} type="button" onClick={() => setShowMembers((v) => !v)} aria-pressed={showMembers} aria-label={showMembers ? 'Ocultar membros' : 'Mostrar membros'} title={showMembers ? 'Ocultar membros' : 'Mostrar membros'}><CallIcon path="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8" size={22} /></button>
+                      </header>
+                    ) : selectedContact && (
                     <header className="conversation-header">
                       <button className="mobile-back" type="button" onClick={() => setSelectedContactId(null)} aria-label="Voltar aos contatos">‹</button>
                       {selectedContact.avatar ? <img className="header-avatar" src={avatarSource(selectedContact.avatar)} alt="" /> : <span className="header-avatar contact-placeholder">{selectedContact.username.slice(0, 1).toUpperCase()}</span>}
@@ -876,12 +1114,15 @@ function App() {
                       <button className="icon-button header-action video-action" type="button" onClick={() => startCall('video')} disabled={callBusy || !!activeCall} aria-label={`Chamada de vídeo com ${selectedContact.username}`} title="Chamada de vídeo"><CallIcon path={callIcons.video} size={22} /></button>
                       <button className="icon-button header-action" type="button" onClick={() => setPanel('profile')} aria-label="Mais opções" title="Mais opções"><img src="/figma-chat/more.svg" alt="" /></button>
                     </header>
-                    {activeCall && [activeCall.call.callerId, activeCall.call.calleeId].includes(selectedContact.id) && <div className="call-dock" ref={setCallDockEl} />}
+                    )}
+                    {activeCall && selectedContact && [activeCall.call.callerId, activeCall.call.calleeId].includes(selectedContact.id) && <div className="call-dock" ref={setCallDockEl} />}
                     <div className="conversation-canvas" ref={canvasRef} onScroll={(e) => { const el = e.currentTarget; stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80 }}>
                       {!openThread?.loaded ? <p className="thread-status">Carregando mensagens…</p> : !openThread.messages.length ? (
-                        <div className="empty-conversation"><span className="empty-mark">✦</span><h1>Conversa com {selectedContact.username}</h1><p>Nenhuma mensagem ainda. Diga olá!</p></div>
+                        isChannel ? (
+                          <div className="empty-conversation channel-welcome"><span className="empty-mark">#</span><h1>Boas-vindas a #{selectedChannel?.name}</h1><p>Este é o começo do canal{selectedChannel?.topic ? ` — ${selectedChannel.topic}` : ''}.</p></div>
+                        ) : <div className="empty-conversation"><span className="empty-mark">✦</span><h1>Conversa com {conv.label}</h1><p>Nenhuma mensagem ainda. Diga olá!</p></div>
                       ) : (
-                        <ol className="message-list" aria-label={`Mensagens com ${selectedContact.username}`}>
+                        <ol className={`message-list ${isChannel ? 'is-channel' : ''}`} aria-label={isChannel ? `Mensagens em ${conv.label}` : `Mensagens com ${conv.label}`}>
                           {openThread.hasMore && <li className="load-older"><button type="button" disabled={loadingOlder} onClick={loadOlder}>{loadingOlder ? 'Carregando…' : 'Carregar mensagens anteriores'}</button></li>}
                           {openThread.messages.map((m, index) => {
                             const mine = m.senderId === user.id
@@ -890,6 +1131,17 @@ function App() {
                             return (
                               <li key={m.id} className="message-row-wrap">
                                 {newDay && <div className="day-separator"><span>{dayLabel(m.createdAt)}</span></div>}
+                                {isChannel && !mine && (!previous || previous.senderId !== m.senderId || newDay) && (() => {
+                                  const author = memberById.get(m.senderId)
+                                  const name = author?.username ?? contacts.find((c) => c.id === m.senderId)?.username ?? 'Ex-membro'
+                                  const avatar = author?.avatar ?? contacts.find((c) => c.id === m.senderId)?.avatar ?? ''
+                                  return (
+                                    <div className="message-author">
+                                      {avatar ? <img className="author-avatar" src={avatarSource(avatar)} alt="" /> : <span className="author-avatar contact-placeholder">{name.slice(0, 1).toUpperCase()}</span>}
+                                      <strong>{name}</strong>
+                                    </div>
+                                  )
+                                })()}
                                 <div className={`message-row ${mine ? 'mine' : 'theirs'} ${previous && previous.senderId === m.senderId && !newDay ? 'grouped' : ''} ${menu?.id === m.id ? 'menu-open' : ''} ${editing?.message.id === m.id ? 'being-edited' : ''}`}>
                                   {m.call ? (() => {
                                     const summary = callSummary(m.call, mine)
@@ -933,7 +1185,7 @@ function App() {
                                       </button>
                                     )}
                                     {m.body && <p>{m.body}</p>}
-                                    <span className="bubble-meta">{m.editedAt && <span className="edited-mark" title={`Editada às ${timeFormat.format(new Date(m.editedAt))}`}>editada</span>}<time dateTime={m.createdAt}>{timeFormat.format(new Date(m.createdAt))}</time>{mine && <ReadTicks message={m} />}</span>
+                                    <span className="bubble-meta">{m.editedAt && <span className="edited-mark" title={`Editada às ${timeFormat.format(new Date(m.editedAt))}`}>editada</span>}<time dateTime={m.createdAt}>{timeFormat.format(new Date(m.createdAt))}</time>{mine && !isChannel && <ReadTicks message={m} />}</span>
                                   </div>
                                   )}
                                 </div>
@@ -951,7 +1203,7 @@ function App() {
                           <button type="button" onClick={cancelEdit} disabled={sending} aria-label="Cancelar edição" title="Cancelar (Esc)"><MenuIcon path={iconPaths.close} /></button>
                         </div>
                       )}
-                      {!isEditing && pending?.contactId === selectedContact.id && (
+                      {!isEditing && pending?.contactId === conv.key && (
                         <div className="image-preview" aria-label={pending.kind === 'image' ? 'Imagem pronta para enviar' : 'Arquivo pronto para enviar'}>
                           <div className={`image-preview-thumb ${pending.kind === 'file' ? 'is-file' : ''}`}>
                             {pending.preview ? <img src={pending.preview} alt="Prévia da imagem" /> : <FileBadge name={pending.file.name} />}
@@ -969,15 +1221,15 @@ function App() {
                           <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5 12.4 20a5.5 5.5 0 0 1-7.8-7.8l8.9-8.9a3.7 3.7 0 0 1 5.2 5.2l-8.9 8.9a1.8 1.8 0 0 1-2.6-2.6l8.2-8.2" /></svg>
                         </button>
                         <input ref={fileInputRef} type="file" hidden accept={attachmentAccept} onChange={(e) => { attachFile(e.target.files?.[0]); e.target.value = '' }} />
-                        <label className="sr-only" htmlFor="composer-input">Mensagem para {selectedContact.username}</label>
-                        <textarea id="composer-input" ref={composerRef} rows={1} maxLength={maxMessageLength} placeholder={isEditing ? (editing?.message.attachment ? 'Legenda' : 'Mensagem') : pending?.contactId === selectedContact.id ? 'Adicionar legenda' : 'Mensagem'} value={composerValue} onKeyDown={composerKeyDown} onChange={(e) => isEditing ? setEditDraft(e.target.value) : setDrafts((all) => ({ ...all, [selectedContact.id]: e.target.value }))} />
-                        <button type="submit" disabled={sending || (isEditing ? !editDraft.trim() && !editing?.message.attachment : !draft.trim() && pending?.contactId !== selectedContact.id)} aria-label={isEditing ? 'Salvar edição' : 'Enviar mensagem'} title={isEditing ? 'Salvar (Enter)' : 'Enviar (Enter)'}>{isEditing ? <svg className="save-edit-icon" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5" /></svg> : <img src="/figma-chat/send.svg" alt="" />}</button>
+                        <label className="sr-only" htmlFor="composer-input">{isChannel ? `Mensagem em ${conv.label}` : `Mensagem para ${conv.label}`}</label>
+                        <textarea id="composer-input" ref={composerRef} rows={1} maxLength={maxMessageLength} placeholder={isEditing ? (editing?.message.attachment ? 'Legenda' : 'Mensagem') : pending?.contactId === conv.key ? 'Adicionar legenda' : isChannel ? `Conversar em ${conv.label}` : 'Mensagem'} value={composerValue} onKeyDown={composerKeyDown} onChange={(e) => isEditing ? setEditDraft(e.target.value) : setDrafts((all) => ({ ...all, [conv.key]: e.target.value }))} />
+                        <button type="submit" disabled={sending || (isEditing ? !editDraft.trim() && !editing?.message.attachment : !draft.trim() && pending?.contactId !== conv.key)} aria-label={isEditing ? 'Salvar edição' : 'Enviar mensagem'} title={isEditing ? 'Salvar (Enter)' : 'Enviar (Enter)'}>{isEditing ? <svg className="save-edit-icon" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5" /></svg> : <img src="/figma-chat/send.svg" alt="" />}</button>
                       </form>
                     </div>
                     {dropActive && <div className="drop-overlay" aria-hidden="true"><div><strong>Solte o arquivo aqui</strong><span>Imagens até 10 MB · PDF, documentos e compactados até 25 MB</span></div></div>}
                   </>
                 ) : (
-                  <div className="welcome-view"><img src="/go-live-icon.png" alt="" /><h1>GO LIVE</h1><p>Selecione um contato para abrir a conversa.</p><span>Mensagens, arquivos, chamadas de voz e vídeo e compartilhamento de tela.</span></div>
+                  <div className="welcome-view"><img src="/go-live-icon.png" alt="" /><h1>GO LIVE</h1><p>{selectedGuildId ? 'Carregando o servidor…' : 'Selecione um contato para abrir a conversa.'}</p><span>Mensagens, arquivos, chamadas de voz e vídeo e compartilhamento de tela.</span></div>
                 )}
               </>
             ) : (
@@ -1013,6 +1265,19 @@ function App() {
                           <span className={`presence-dot ${value}`} aria-hidden="true" />
                           <span><strong>{label}</strong><small>{hint}</small></span>
                           {status === value && <svg className="status-check" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5" /></svg>}
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+
+                  <section className="settings-group" aria-labelledby="theme-title">
+                    <h3 id="theme-title">Aparência</h3>
+                    <div className="theme-options" role="radiogroup" aria-label="Tema">
+                      {([['light', 'Claro', 'M12 4V2M12 22v-2M4.9 4.9 3.5 3.5M20.5 20.5l-1.4-1.4M4 12H2M22 12h-2M4.9 19.1l-1.4 1.4M20.5 3.5l-1.4 1.4M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z'], ['dark', 'Escuro', 'M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z'], ['system', 'Automático', 'M3 4h18v12H3zM8 20h8M12 16v4']] as const).map(([value, label, icon]) => (
+                        <button key={value} type="button" role="radio" aria-checked={themePref === value} className={`theme-option ${themePref === value ? 'active' : ''}`} onClick={() => setThemePref(value)}>
+                          <span className={`theme-swatch ${value}`} aria-hidden="true"><CallIcon path={icon} size={18} /></span>
+                          <strong>{label}</strong>
+                          {value === 'system' && <small>Segue o sistema</small>}
                         </button>
                       ))}
                     </div>
@@ -1076,8 +1341,30 @@ function App() {
               </div>
             )}
           </section>
+          {selectedGuild && isChannel && showMembers && panel === 'chat' && <MemberList guild={selectedGuild} me={user.id} statusOf={statusOf} onAction={memberAction} />}
         </>
       )}
+      {user && guildDialog && (() => {
+        const close = () => setGuildDialog(null)
+        switch (guildDialog.kind) {
+          case 'add-server': return <AddServerDialog onClose={close} onCreated={joinedGuild} onJoinCode={(code) => setGuildDialog({ kind: 'invite-preview', code })} notify={notify} />
+          case 'invite-preview': return <InvitePreviewDialog code={guildDialog.code} onClose={close} onJoined={joinedGuild} notify={notify} />
+          case 'confirm': return <ConfirmDialog title={guildDialog.title} text={guildDialog.text} action={guildDialog.action} onConfirm={guildDialog.run} onClose={close} />
+        }
+        if (!selectedGuild) return null
+        switch (guildDialog.kind) {
+          case 'invite': return <InviteDialog guild={selectedGuild} onClose={close} notify={notify} />
+          case 'add-members': return <AddMembersDialog guild={selectedGuild} contacts={contacts.map((c) => ({ ...c, avatar: c.avatar }))} onClose={close} notify={notify} />
+          case 'settings': return <GuildSettingsDialog guild={selectedGuild} onClose={close} onDeleted={() => { close(); openGuild(null); loadGuilds(); notify('success', 'Servidor excluído.') }} notify={notify} />
+          case 'channel': return <ChannelDialog guild={selectedGuild} channel={guildDialog.channel} initialKind={guildDialog.voice ? 'voice' : 'text'} onClose={close} notify={notify}
+            onSaved={(saved) => {
+              close(); void loadGuild(selectedGuild.id)
+              if (saved && saved.kind === 'text') setChannelByGuild((all) => ({ ...all, [selectedGuild.id]: saved.id }))
+              notify('success', saved ? (guildDialog.channel ? 'Canal atualizado.' : `${saved.kind === 'voice' ? 'Canal de voz' : '#'}${saved.kind === 'voice' ? ` ${saved.name}` : saved.name} criado.`) : 'Canal excluído.')
+            }} />
+        }
+        return null
+      })()}
       <Suspense fallback={null}>
       {user && incomingCall && !activeCall && (() => {
         const peer = contacts.find((c) => c.id === incomingCall.callerId)
@@ -1091,6 +1378,20 @@ function App() {
           docked={docked} dockEl={callDockEl} miniEl={callMiniEl} onOpen={() => { setSelectedContactId(peerId); setPanel('chat') }} onEnd={endCall} notify={notify} />
       })()}
       </Suspense>
+      {user && activeVoice && (() => {
+        const g = guildDetails[activeVoice.guildId]
+        const channel = g?.channels.find((c) => c.id === activeVoice.channelId)
+        const members = new Map((g?.members ?? []).map((m) => [m.userId, m]))
+        const docked = panel === 'chat' && selectedGuildId === activeVoice.guildId && selectedChannel?.id === activeVoice.channelId
+        return (
+          <Suspense fallback={null}>
+            <VoiceScreen key={`${activeVoice.channelId}:${activeVoice.token}`} join={activeVoice} channelName={channel?.name ?? 'Canal de voz'} guildName={g?.name ?? ''}
+              me={{ id: user.id, username: user.username, avatar: user.avatar ? avatarSource(user.avatar) : '' }}
+              person={(id) => { const m = members.get(id); return { id, username: m?.username ?? 'Membro', avatar: m?.avatar ? avatarSource(m.avatar) : '' } }}
+              docked={docked} dockEl={voiceDockEl} miniEl={callMiniEl} onOpen={openVoiceView} onLeave={leaveVoice} onSpeaking={setSpeakingIds} onState={reportVoiceState} notify={notify} />
+          </Suspense>
+        )
+      })()}
       {confirmDelete && (
         <div className="app-modal-backdrop" onClick={(e) => { if (e.target === e.currentTarget && !deleting) setConfirmDelete(null) }}>
           <div className="app-modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-title" aria-describedby="delete-desc">

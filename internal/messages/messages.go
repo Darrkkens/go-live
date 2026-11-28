@@ -47,7 +47,8 @@ func (s Store) changeError(ctx context.Context, userID string, messageID int64) 
 type Message struct {
 	ID          int64       `json:"id"`
 	SenderID    string      `json:"senderId"`
-	RecipientID string      `json:"recipientId"`
+	RecipientID string      `json:"recipientId,omitempty"`
+	ChannelID   string      `json:"channelId,omitempty"`
 	Body        string      `json:"body"`
 	Attachment  *Attachment `json:"attachment"`
 	CreatedAt   time.Time   `json:"createdAt"`
@@ -128,7 +129,22 @@ func (s Store) Migrate(ctx context.Context) error {
 		ADD COLUMN IF NOT EXISTS call_id TEXT,
 		ADD COLUMN IF NOT EXISTS call_status TEXT,
 		ADD COLUMN IF NOT EXISTS call_media TEXT,
-		ADD COLUMN IF NOT EXISTS call_duration INT;
+		ADD COLUMN IF NOT EXISTS call_duration INT,
+		ADD COLUMN IF NOT EXISTS channel_id UUID;
+	-- A message goes either to one user (direct message) or to a server channel.
+	ALTER TABLE direct_messages ALTER COLUMN recipient_id DROP NOT NULL;
+	DO $$ BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='direct_messages_target_check') THEN
+			ALTER TABLE direct_messages ADD CONSTRAINT direct_messages_target_check CHECK ((recipient_id IS NULL) <> (channel_id IS NULL));
+		END IF;
+	END $$;
+	CREATE INDEX IF NOT EXISTS direct_messages_channel_idx ON direct_messages (channel_id, id DESC) WHERE channel_id IS NOT NULL;
+	CREATE TABLE IF NOT EXISTS channel_reads (
+		user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		channel_id UUID NOT NULL,
+		last_read_id BIGINT NOT NULL DEFAULT 0,
+		PRIMARY KEY (user_id, channel_id)
+	);
 	DO $$ BEGIN
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='direct_messages_content_v3_check') THEN
 			ALTER TABLE direct_messages DROP CONSTRAINT IF EXISTS direct_messages_body_check;
@@ -145,16 +161,17 @@ func (s Store) Migrate(ctx context.Context) error {
 	return err
 }
 
-const columns = `id,sender_id,recipient_id,body,created_at,read_at,attachment_name,attachment_type,attachment_width,attachment_height,attachment_original_name,attachment_size,edited_at,deleted_at,call_id,call_status,call_media,call_duration`
+const columns = `id,sender_id,recipient_id,body,created_at,read_at,attachment_name,attachment_type,attachment_width,attachment_height,attachment_original_name,attachment_size,edited_at,deleted_at,call_id,call_status,call_media,call_duration,channel_id`
 
 func scanInto(row interface{ Scan(...any) error }, m *Message, extra ...any) error {
 	var readAt, editedAt, deletedAt sql.NullTime
-	var name, contentType, original, callID, callStatus, callMedia sql.NullString
+	var recipient, channel, name, contentType, original, callID, callStatus, callMedia sql.NullString
 	var width, height, size, callDuration sql.NullInt64
-	dest := append([]any{&m.ID, &m.SenderID, &m.RecipientID, &m.Body, &m.CreatedAt, &readAt, &name, &contentType, &width, &height, &original, &size, &editedAt, &deletedAt, &callID, &callStatus, &callMedia, &callDuration}, extra...)
+	dest := append([]any{&m.ID, &m.SenderID, &recipient, &m.Body, &m.CreatedAt, &readAt, &name, &contentType, &width, &height, &original, &size, &editedAt, &deletedAt, &callID, &callStatus, &callMedia, &callDuration, &channel}, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return err
 	}
+	m.RecipientID, m.ChannelID = recipient.String, channel.String
 	for _, t := range []struct {
 		src sql.NullTime
 		dst **time.Time
@@ -296,7 +313,7 @@ func (s Store) Delete(ctx context.Context, userID string, messageID int64) (Mess
 			attachment_width=NULL, attachment_height=NULL, attachment_original_name=NULL, attachment_size=NULL
 		FROM old WHERE m.id=old.id
 		RETURNING m.id,m.sender_id,m.recipient_id,m.body,m.created_at,m.read_at,m.attachment_name,m.attachment_type,m.attachment_width,
-			m.attachment_height,m.attachment_original_name,m.attachment_size,m.edited_at,m.deleted_at,m.call_id,m.call_status,m.call_media,m.call_duration,old.attachment_name`, messageID, userID), &m, &file)
+			m.attachment_height,m.attachment_original_name,m.attachment_size,m.edited_at,m.deleted_at,m.call_id,m.call_status,m.call_media,m.call_duration,m.channel_id,old.attachment_name`, messageID, userID), &m, &file)
 	if errors.Is(err, sql.ErrNoRows) {
 		if cause := s.changeError(ctx, userID, messageID); cause != ErrInvalid {
 			return Message{}, "", cause
@@ -332,7 +349,16 @@ func (s Store) UpdateCall(ctx context.Context, callID, status string, duration i
 	return m, err
 }
 
-// Attachment returns a message's image if the user took part in the conversation.
+// Get returns one message by id; callers check who may see it.
+func (s Store) Get(ctx context.Context, messageID int64) (Message, error) {
+	m, err := scan(s.DB.QueryRowContext(ctx, `SELECT `+columns+` FROM direct_messages WHERE id=$1`, messageID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Message{}, ErrNotFound
+	}
+	return m, err
+}
+
+// Attachment returns a direct message's attachment if the user took part in the conversation.
 func (s Store) Attachment(ctx context.Context, userID string, messageID int64) (Attachment, error) {
 	m, err := scan(s.DB.QueryRowContext(ctx, `SELECT `+columns+` FROM direct_messages WHERE id=$1 AND (sender_id=$2 OR recipient_id=$2)`, messageID, userID))
 	if err != nil {
@@ -361,11 +387,11 @@ func (s Store) MarkRead(ctx context.Context, userID, contactID string) (time.Tim
 func (s Store) Conversations(ctx context.Context, userID string) ([]Conversation, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT ON (mine.other) mine.id,mine.sender_id,mine.recipient_id,mine.body,mine.created_at,mine.read_at,
 		mine.attachment_name,mine.attachment_type,mine.attachment_width,mine.attachment_height,mine.attachment_original_name,mine.attachment_size,
-		mine.edited_at,mine.deleted_at,mine.call_id,mine.call_status,mine.call_media,mine.call_duration,mine.other,
+		mine.edited_at,mine.deleted_at,mine.call_id,mine.call_status,mine.call_media,mine.call_duration,mine.channel_id,mine.other,
 		(SELECT COUNT(*) FROM direct_messages u WHERE u.recipient_id=$1 AND u.sender_id=mine.other AND u.read_at IS NULL AND u.deleted_at IS NULL
 			AND (u.call_status IS NULL OR u.call_status IN ('missed','cancelled')))
 		FROM (SELECT m.*, CASE WHEN m.sender_id=$1 THEN m.recipient_id ELSE m.sender_id END AS other
-			FROM direct_messages m WHERE m.sender_id=$1 OR m.recipient_id=$1) mine
+			FROM direct_messages m WHERE (m.sender_id=$1 OR m.recipient_id=$1) AND m.channel_id IS NULL) mine
 		JOIN users ON users.id=mine.other AND users.account_status='active'
 		ORDER BY mine.other, mine.id DESC`, userID)
 	if err != nil {
@@ -381,4 +407,95 @@ func (s Store) Conversations(ctx context.Context, userID string) ([]Conversation
 		list = append(list, c)
 	}
 	return list, rows.Err()
+}
+
+// SendToChannel stores a message in a server channel. The caller checks membership.
+func (s Store) SendToChannel(ctx context.Context, senderID, channelID, body string, a *Attachment) (Message, error) {
+	var err error
+	if a == nil || strings.TrimSpace(body) != "" {
+		if body, err = NormalizeBody(body); err != nil {
+			return Message{}, err
+		}
+	} else {
+		body = ""
+	}
+	var name, contentType, original sql.NullString
+	var width, height, size sql.NullInt64
+	if a != nil {
+		if !a.valid() {
+			return Message{}, ErrInvalid
+		}
+		name, contentType, original = sql.NullString{String: a.FileName, Valid: true}, sql.NullString{String: a.ContentType, Valid: true}, sql.NullString{String: a.Name, Valid: true}
+		size = sql.NullInt64{Int64: a.Size, Valid: true}
+		width, height = sql.NullInt64{Int64: int64(a.Width), Valid: a.Width > 0}, sql.NullInt64{Int64: int64(a.Height), Valid: a.Height > 0}
+	}
+	m, err := scan(s.DB.QueryRowContext(ctx, `INSERT INTO direct_messages (sender_id,channel_id,body,attachment_name,attachment_type,attachment_width,attachment_height,attachment_original_name,attachment_size)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING `+columns, senderID, channelID, body, name, contentType, width, height, original, size))
+	if err != nil {
+		return Message{}, err
+	}
+	// The sender has read everything up to their own message.
+	_, err = s.DB.ExecContext(ctx, `INSERT INTO channel_reads (user_id,channel_id,last_read_id) VALUES ($1,$2,$3)
+		ON CONFLICT (user_id,channel_id) DO UPDATE SET last_read_id=GREATEST(channel_reads.last_read_id, EXCLUDED.last_read_id)`, senderID, channelID, m.ID)
+	return m, err
+}
+
+// ChannelHistory returns up to limit channel messages, oldest first, with ids lower than before.
+func (s Store) ChannelHistory(ctx context.Context, channelID string, before int64, limit int) ([]Message, error) {
+	if limit <= 0 || limit > MaxPageSize {
+		limit = DefaultPageSize
+	}
+	if before <= 0 {
+		before = 1<<63 - 1
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT `+columns+` FROM direct_messages WHERE channel_id=$1 AND id<$2 ORDER BY id DESC LIMIT $3`, channelID, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	list := []Message{}
+	for rows.Next() {
+		m, err := scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, m)
+	}
+	for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
+		list[i], list[j] = list[j], list[i]
+	}
+	return list, rows.Err()
+}
+
+// MarkChannelRead records that the user has read the channel up to its latest message.
+func (s Store) MarkChannelRead(ctx context.Context, userID, channelID string) error {
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO channel_reads (user_id,channel_id,last_read_id)
+		SELECT $1,$2,COALESCE(MAX(id),0) FROM direct_messages WHERE channel_id=$2
+		ON CONFLICT (user_id,channel_id) DO UPDATE SET last_read_id=GREATEST(channel_reads.last_read_id, EXCLUDED.last_read_id)`, userID, channelID)
+	return err
+}
+
+// ChannelUnread counts messages from others the user has not read, per channel.
+func (s Store) ChannelUnread(ctx context.Context, userID string, channelIDs []string) (map[string]int, error) {
+	counts := map[string]int{}
+	if len(channelIDs) == 0 {
+		return counts, nil
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT m.channel_id, COUNT(*) FROM direct_messages m
+		LEFT JOIN channel_reads r ON r.user_id=$1 AND r.channel_id=m.channel_id
+		WHERE m.channel_id = ANY($2::uuid[]) AND m.sender_id<>$1 AND m.deleted_at IS NULL AND m.id > COALESCE(r.last_read_id,0)
+		GROUP BY m.channel_id`, userID, "{"+strings.Join(channelIDs, ",")+"}")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		counts[id] = n
+	}
+	return counts, rows.Err()
 }

@@ -51,6 +51,7 @@ type videoGrant struct {
 	Room              string   `json:"room,omitempty"`
 	RoomJoin          bool     `json:"roomJoin,omitempty"`
 	RoomCreate        bool     `json:"roomCreate,omitempty"`
+	RoomAdmin         bool     `json:"roomAdmin,omitempty"`
 	CanPublish        *bool    `json:"canPublish,omitempty"`
 	CanSubscribe      *bool    `json:"canSubscribe,omitempty"`
 	CanPublishData    *bool    `json:"canPublishData,omitempty"`
@@ -96,16 +97,25 @@ func (c Config) JoinToken(room, identity, name string, ttl time.Duration) (strin
 
 // DeleteRoom disconnects everyone from a room. A missing room is not an error.
 func (c Config) DeleteRoom(ctx context.Context, room string) error {
+	return c.roomService(ctx, "DeleteRoom", room, map[string]string{"room": room})
+}
+
+// RemoveParticipant disconnects one user from a room. A missing room or user is not an error.
+func (c Config) RemoveParticipant(ctx context.Context, room, identity string) error {
+	return c.roomService(ctx, "RemoveParticipant", room, map[string]string{"room": room, "identity": identity})
+}
+
+func (c Config) roomService(ctx context.Context, method, room string, body map[string]string) error {
 	if !c.Enabled() {
 		return nil
 	}
 	now := time.Now()
-	token, err := c.sign(claims{Issuer: c.APIKey, NotBefore: now.Add(-10 * time.Second).Unix(), ExpiresAt: now.Add(time.Minute).Unix(), Video: videoGrant{RoomCreate: true}})
+	token, err := c.sign(claims{Issuer: c.APIKey, NotBefore: now.Add(-10 * time.Second).Unix(), ExpiresAt: now.Add(time.Minute).Unix(), Video: videoGrant{Room: room, RoomAdmin: true, RoomCreate: true}})
 	if err != nil {
 		return err
 	}
-	payload, _ := json.Marshal(map[string]string{"room": room})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.APIURL, "/")+"/twirp/livekit.RoomService/DeleteRoom", bytes.NewReader(payload))
+	payload, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.APIURL, "/")+"/twirp/livekit.RoomService/"+method, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -119,5 +129,5 @@ func (c Config) DeleteRoom(ctx context.Context, room string) error {
 	if res.StatusCode == http.StatusNotFound || res.StatusCode < 300 {
 		return nil
 	}
-	return fmt.Errorf("livekit DeleteRoom: HTTP %d", res.StatusCode)
+	return fmt.Errorf("livekit %s: HTTP %d", method, res.StatusCode)
 }

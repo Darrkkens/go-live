@@ -119,7 +119,7 @@ func (s *Server) sendMessage(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível enviar a mensagem."})
 		return
 	}
-	s.hub.emit(messageEvent{Type: "message", Message: m}, m.SenderID, m.RecipientID)
+	s.emitMessage("message", m)
 	c.JSON(http.StatusCreated, m)
 }
 
@@ -163,7 +163,7 @@ func (s *Server) editMessage(c *gin.Context) {
 	case err != nil:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Não foi possível editar a mensagem."})
 	default:
-		s.hub.emit(messageEvent{Type: "message_updated", Message: m}, m.SenderID, m.RecipientID)
+		s.emitMessage("message_updated", m)
 		c.JSON(http.StatusOK, m)
 	}
 }
@@ -196,7 +196,7 @@ func (s *Server) deleteMessage(c *gin.Context) {
 	if file != "" {
 		_ = os.Remove(filepath.Join(attachmentDir(), filepath.Base(file)))
 	}
-	s.hub.emit(messageEvent{Type: "message_updated", Message: m}, m.SenderID, m.RecipientID)
+	s.emitMessage("message_updated", m)
 	c.JSON(http.StatusOK, m)
 }
 

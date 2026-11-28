@@ -153,6 +153,10 @@ func (s *Server) startCall(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "Você já está em uma ligação."})
 		return
 	}
+	if s.voice.channelOf(u.ID) != "" {
+		c.JSON(http.StatusConflict, gin.H{"error": "Saia do canal de voz antes de ligar."})
+		return
+	}
 	call := &activeCall{callInfo: callInfo{ID: uuid.NewString(), CallerID: u.ID, CalleeID: contact.ID, Media: body.Media, Status: messages.CallRinging, StartedAt: time.Now().UTC()}}
 	call.room = "call-" + call.ID
 
@@ -161,7 +165,7 @@ func (s *Server) startCall(c *gin.Context) {
 	switch {
 	case !s.hub.online(contact.ID) || contact.Status == "offline":
 		unavailable = "offline"
-	case s.calls.forUser(contact.ID) != nil:
+	case s.calls.forUser(contact.ID) != nil || s.voice.channelOf(contact.ID) != "":
 		unavailable = "busy"
 	}
 	status := messages.CallRinging
@@ -321,6 +325,7 @@ func (s *Server) userWentOffline(userID string) {
 		if s.hub.online(userID) {
 			return
 		}
+		s.leaveVoice(userID, true)
 		s.calls.mu.Lock()
 		defer s.calls.mu.Unlock()
 		call := s.calls.forUser(userID)

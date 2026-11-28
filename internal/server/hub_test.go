@@ -51,3 +51,38 @@ func TestEndStatus(t *testing.T) {
 		t.Fatal("unexpected end status")
 	}
 }
+
+func TestVoiceManager(t *testing.T) {
+	v := newVoiceManager()
+	if prev, ok := v.join("g", "c1", "a"); !ok || prev != "" {
+		t.Fatal("first join")
+	}
+	v.join("g", "c1", "b")
+	if prev, ok := v.join("g", "c2", "a"); !ok || prev != "c1" {
+		t.Fatalf("move: %q", prev)
+	}
+	if got := v.forGuild("g"); len(got["c1"]) != 1 || len(got["c2"]) != 1 || got["c1"][0].UserID != "b" {
+		t.Fatalf("state after move: %+v", got)
+	}
+	if ch, _ := v.setState("a", true, true, false, true); ch != "c2" {
+		t.Fatal("set state")
+	}
+	if m := v.forGuild("g")["c2"][0]; !m.Muted || !m.Deafened || !m.Screen {
+		t.Fatalf("state not saved: %+v", m)
+	}
+	if ch, g := v.leave("a"); ch != "c2" || g != "g" || v.channelOf("a") != "" {
+		t.Fatal("leave")
+	}
+	if _, ok := v.forGuild("g")["c2"]; ok {
+		t.Fatal("empty channel kept")
+	}
+	if ids := v.clearChannel("c1"); len(ids) != 1 || v.channelOf("b") != "" {
+		t.Fatalf("clear: %v", ids)
+	}
+	for i := 0; i < maxVoiceMembers; i++ {
+		v.join("g", "full", string(rune('A'+i)))
+	}
+	if _, ok := v.join("g", "full", "late"); ok {
+		t.Fatal("joined a full channel")
+	}
+}

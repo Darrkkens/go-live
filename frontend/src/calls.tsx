@@ -68,7 +68,7 @@ type Tile = {
 }
 
 function CallTile({ tile, focused, small, status, onClick }: { tile: Tile; focused: boolean; small?: boolean; status?: string; onClick: () => void }) {
-  const label = tile.kind === 'screen' ? `Tela de ${tile.isLocal ? 'você' : tile.person.username}` : tile.isLocal ? `${tile.person.username} (você)` : tile.person.username
+  const label = tile.kind === 'screen' ? (tile.isLocal ? 'Sua tela' : `Tela de ${tile.person.username}`) : tile.isLocal ? `${tile.person.username} (você)` : tile.person.username
   return (
     <button type="button" className={`vc-tile ${tile.kind} ${tile.speaking && tile.kind === 'camera' ? 'speaking' : ''} ${focused ? 'focused' : ''} ${small ? 'small' : ''}`}
       onClick={onClick} aria-label={`${label}${focused ? ' (em destaque, clique para voltar à grade)' : ' (clique para destacar)'}`}>
@@ -87,68 +87,74 @@ function CallTile({ tile, focused, small, status, onClick }: { tile: Tile; focus
   )
 }
 
-export function CallScreen({ join, me, peer, startVideo, docked, dockEl, miniEl, onOpen, onEnd, notify }: {
-  join: CallJoin
-  me: CallPerson
-  peer: CallPerson
+type Notify = (kind: 'success' | 'error', message: string) => void
+
+/**
+ * Connects to a LiveKit room and exposes participant tiles and device toggles.
+ * Shared by one-to-one calls and voice channels. person() maps a participant
+ * identity (the user id) to the name and avatar shown on its tile.
+ */
+function useRoom({ url, token, startVideo, notify, person, deafened = false }: {
+  url?: string
+  token?: string
   startVideo: boolean
-  /** Whether the conversation with the peer is open, so the call shows there. */
-  docked: boolean
-  dockEl: HTMLElement | null
-  miniEl: HTMLElement | null
-  onOpen: () => void
-  onEnd: () => void
-  notify: (kind: 'success' | 'error', message: string) => void
+  notify: Notify
+  person: (identity: string, isLocal: boolean) => CallPerson
+  deafened?: boolean
 }) {
-  const { call } = join
   const [connection, setConnection] = useState<ConnectionState>(ConnectionState.Disconnected)
   const [tiles, setTiles] = useState<Tile[]>([])
-  const [peerJoined, setPeerJoined] = useState(false)
+  const [remoteCount, setRemoteCount] = useState(0)
   const [micOn, setMicOn] = useState(true)
   const [camOn, setCamOn] = useState(false)
   const [screenOn, setScreenOn] = useState(false)
   const [needsAudioClick, setNeedsAudioClick] = useState(false)
-  const [now, setNow] = useState(() => Date.now())
   const [failed, setFailed] = useState<string | null>(null)
-  // null: automatic (a screen share takes focus), 'grid': no focus, otherwise a tile key.
-  const [focus, setFocus] = useState<string | null>(null)
-  const [fullscreen, setFullscreen] = useState(false)
-  // null: automatic height; otherwise the height the user dragged to.
-  const [panelHeight, setPanelHeight] = useState<number | null>(savedHeight)
-  const [resizing, setResizing] = useState(false)
   const roomRef = useRef<Room | null>(null)
   const audioRef = useRef<HTMLDivElement>(null)
-  const panelRef = useRef<HTMLDivElement>(null)
-  const outgoing = call.callerId === me.id
-  useTone('outgoing', outgoing && call.status === 'ringing')
+  const personRef = useRef(person)
+  const deafRef = useRef(deafened)
+  const refreshRef = useRef<() => void>(() => {})
+  useEffect(() => { personRef.current = person; refreshRef.current() })
 
   useEffect(() => {
-    if (!join.url || !join.token) return
+    deafRef.current = deafened
+    audioRef.current?.querySelectorAll('audio').forEach((el) => { el.muted = deafened })
+  }, [deafened])
+
+  useEffect(() => {
+    if (!url || !token) return
     const room = new Room({ adaptiveStream: true, dynacast: true })
     roomRef.current = room
     let cancelled = false
 
     const refresh = () => {
       const next: Tile[] = []
-      const add = (p: Participant, person: CallPerson, isLocal: boolean) => {
+      const add = (p: Participant, isLocal: boolean) => {
+        const who = personRef.current(p.identity, isLocal)
         const camera = p.getTrackPublication(Track.Source.Camera)
         const mic = p.getTrackPublication(Track.Source.Microphone)
         const screen = p.getTrackPublication(Track.Source.ScreenShare)
-        next.push({ key: `camera:${person.id}`, kind: 'camera', person, isLocal, track: camera?.track && !camera.isMuted ? camera.track : undefined, muted: !mic || mic.isMuted, speaking: p.isSpeaking })
-        if (screen?.track) next.push({ key: `screen:${person.id}`, kind: 'screen', person, isLocal, track: screen.track, muted: false, speaking: false })
+        next.push({ key: `camera:${p.identity}`, kind: 'camera', person: who, isLocal, track: camera?.track && !camera.isMuted ? camera.track : undefined, muted: !mic || mic.isMuted, speaking: p.isSpeaking })
+        if (screen?.track) next.push({ key: `screen:${p.identity}`, kind: 'screen', person: who, isLocal, track: screen.track, muted: false, speaking: false })
       }
-      const remote = [...room.remoteParticipants.values()][0]
-      if (remote) add(remote, peer, false)
-      add(room.localParticipant, me, true)
+      const remotes = [...room.remoteParticipants.values()].sort((a, b) => (a.joinedAt?.getTime() ?? 0) - (b.joinedAt?.getTime() ?? 0))
+      remotes.forEach((p) => add(p, false))
+      add(room.localParticipant, true)
       setTiles(next)
-      setPeerJoined(!!remote)
+      setRemoteCount(remotes.length)
       const local = room.localParticipant
       setMicOn(local.isMicrophoneEnabled)
       setCamOn(local.isCameraEnabled)
       setScreenOn(local.isScreenShareEnabled)
     }
+    refreshRef.current = refresh
     const onSubscribed = (track: RemoteTrack) => {
-      if (track.kind === Track.Kind.Audio && audioRef.current) audioRef.current.appendChild(track.attach())
+      if (track.kind === Track.Kind.Audio && audioRef.current) {
+        const el = track.attach()
+        el.muted = deafRef.current
+        audioRef.current.appendChild(el)
+      }
       refresh()
     }
     const onUnsubscribed = (track: RemoteTrack) => { track.detach().forEach((el) => el.remove()); refresh() }
@@ -168,12 +174,14 @@ export function CallScreen({ join, me, peer, startVideo, docked, dockEl, miniEl,
 
     ;(async () => {
       try {
-        await room.connect(join.url!, join.token!)
+        await room.connect(url, token)
         if (cancelled) return
         refresh()
-        // A call can end while devices start; then the failure is expected and silent.
-        try { await room.localParticipant.setMicrophoneEnabled(true) }
-        catch { if (!cancelled) notify('error', 'Não foi possível usar o microfone. Verifique a permissão do navegador.') }
+        // The room can close while devices start; then the failure is expected and silent.
+        if (!deafRef.current) {
+          try { await room.localParticipant.setMicrophoneEnabled(true) }
+          catch { if (!cancelled) notify('error', 'Não foi possível usar o microfone. Verifique a permissão do navegador.') }
+        }
         if (startVideo && !cancelled) {
           try { await room.localParticipant.setCameraEnabled(true) }
           catch { if (!cancelled) notify('error', 'Não foi possível usar a câmera. Verifique a permissão do navegador.') }
@@ -189,11 +197,57 @@ export function CallScreen({ join, me, peer, startVideo, docked, dockEl, miniEl,
     return () => {
       cancelled = true
       roomRef.current = null
+      refreshRef.current = () => {}
       void room.disconnect()
     }
-    // The room lives for this call; a new token means a new call.
+    // The room lives for this token; a new token means a new connection.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [join.url, join.token])
+  }, [url, token])
+
+  async function toggle(kind: 'mic' | 'camera' | 'screen', force?: boolean) {
+    const local = roomRef.current?.localParticipant
+    if (!local) return
+    try {
+      if (kind === 'mic') { await local.setMicrophoneEnabled(force ?? !local.isMicrophoneEnabled); setMicOn(local.isMicrophoneEnabled) }
+      if (kind === 'camera') { await local.setCameraEnabled(!local.isCameraEnabled); setCamOn(local.isCameraEnabled) }
+      if (kind === 'screen') { await local.setScreenShareEnabled(!local.isScreenShareEnabled, { audio: true }); setScreenOn(local.isScreenShareEnabled) }
+    } catch (err) {
+      const name = (err as Error).name
+      if (name === 'NotAllowedError' && kind === 'screen') return // the user closed the picker
+      notify('error', kind === 'screen' ? 'Não foi possível compartilhar a tela.' : kind === 'camera' ? 'Não foi possível ligar a câmera. Verifique a permissão do navegador.' : 'Não foi possível usar o microfone.')
+    }
+  }
+
+  return { roomRef, audioRef, connection, tiles, remoteCount, micOn, camOn, screenOn, needsAudioClick, failed, toggle }
+}
+
+export function CallScreen({ join, me, peer, startVideo, docked, dockEl, miniEl, onOpen, onEnd, notify }: {
+  join: CallJoin
+  me: CallPerson
+  peer: CallPerson
+  startVideo: boolean
+  /** Whether the conversation with the peer is open, so the call shows there. */
+  docked: boolean
+  dockEl: HTMLElement | null
+  miniEl: HTMLElement | null
+  onOpen: () => void
+  onEnd: () => void
+  notify: (kind: 'success' | 'error', message: string) => void
+}) {
+  const { call } = join
+  const [now, setNow] = useState(() => Date.now())
+  // null: automatic (a screen share takes focus), 'grid': no focus, otherwise a tile key.
+  const [focus, setFocus] = useState<string | null>(null)
+  const [fullscreen, setFullscreen] = useState(false)
+  // null: automatic height; otherwise the height the user dragged to.
+  const [panelHeight, setPanelHeight] = useState<number | null>(savedHeight)
+  const [resizing, setResizing] = useState(false)
+  const panelRef = useRef<HTMLDivElement>(null)
+  const outgoing = call.callerId === me.id
+  useTone('outgoing', outgoing && call.status === 'ringing')
+  const { roomRef, audioRef, connection, tiles, remoteCount, micOn, camOn, screenOn, needsAudioClick, failed, toggle } =
+    useRoom({ url: join.url, token: join.token, startVideo, notify, person: (_id, isLocal) => isLocal ? me : peer })
+  const peerJoined = remoteCount > 0
 
   useEffect(() => {
     if (call.status !== 'active' && !(outgoing && call.status === 'ringing')) return
@@ -206,20 +260,6 @@ export function CallScreen({ join, me, peer, startVideo, docked, dockEl, miniEl,
     document.addEventListener('fullscreenchange', onChange)
     return () => document.removeEventListener('fullscreenchange', onChange)
   }, [])
-
-  async function toggle(kind: 'mic' | 'camera' | 'screen') {
-    const local = roomRef.current?.localParticipant
-    if (!local) return
-    try {
-      if (kind === 'mic') { await local.setMicrophoneEnabled(!local.isMicrophoneEnabled); setMicOn(local.isMicrophoneEnabled) }
-      if (kind === 'camera') { await local.setCameraEnabled(!local.isCameraEnabled); setCamOn(local.isCameraEnabled) }
-      if (kind === 'screen') { await local.setScreenShareEnabled(!local.isScreenShareEnabled, { audio: true }); setScreenOn(local.isScreenShareEnabled) }
-    } catch (err) {
-      const name = (err as Error).name
-      if (name === 'NotAllowedError' && kind === 'screen') return // the user closed the picker
-      notify('error', kind === 'screen' ? 'Não foi possível compartilhar a tela.' : kind === 'camera' ? 'Não foi possível ligar a câmera. Verifique a permissão do navegador.' : 'Não foi possível usar o microfone.')
-    }
-  }
 
   function applyHeight(next: number | null) {
     const value = next === null ? null : Math.round(Math.min(maxPanelHeight(panelRef.current), Math.max(minPanelHeight, next)))
@@ -338,6 +378,137 @@ export function CallScreen({ join, me, peer, startVideo, docked, dockEl, miniEl,
       </button>
       <button type="button" className={`vc-mini-btn ${micOn ? '' : 'muted'}`} onClick={() => toggle('mic')} aria-label={micOn ? 'Desativar microfone' : 'Ativar microfone'} title={micOn ? 'Desativar microfone' : 'Ativar microfone'}><Icon path={micOn ? callIcons.mic : callIcons.micOff} size={18} /></button>
       <button type="button" className="vc-mini-btn hangup" onClick={onEnd} aria-label="Encerrar ligação" title="Encerrar ligação"><Icon path={callIcons.hangup} size={18} /></button>
+    </div>
+  )
+
+  return (
+    <>
+      <div ref={audioRef} hidden />
+      {docked && dockEl ? createPortal(panel, dockEl) : miniEl ? createPortal(mini, miniEl) : null}
+    </>
+  )
+}
+
+export type VoiceJoin = { channelId: string; guildId: string; url: string; token: string }
+export type VoiceState = { muted: boolean; deafened: boolean; video: boolean; screen: boolean }
+
+const headphones = 'M3 14v-2a9 9 0 0 1 18 0v2M21 14v3a2 2 0 0 1-2 2h-1v-6h3M3 14v3a2 2 0 0 0 2 2h1v-6H3'
+const headphonesOff = headphones + 'M3 3l18 18'
+const speaker = 'M11 5 6 9H2v6h4l5 4V5ZM15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14'
+
+/** A voice channel: anyone in the server can drop in and out, like Discord. */
+export function VoiceScreen({ join, channelName, guildName, me, person, docked, dockEl, miniEl, onOpen, onLeave, onSpeaking, onState, notify }: {
+  join: VoiceJoin
+  channelName: string
+  guildName: string
+  me: CallPerson
+  person: (id: string) => CallPerson
+  /** Whether the voice channel is open in the main area. */
+  docked: boolean
+  dockEl: HTMLElement | null
+  miniEl: HTMLElement | null
+  onOpen: () => void
+  onLeave: () => void
+  onSpeaking: (ids: string[]) => void
+  onState: (state: VoiceState) => void
+  notify: Notify
+}) {
+  const [deafened, setDeafened] = useState(false)
+  const [focus, setFocus] = useState<string | null>(null)
+  const [fullscreen, setFullscreen] = useState(false)
+  const micBeforeDeaf = useRef(true)
+  const panelRef = useRef<HTMLElement>(null)
+  const { roomRef, audioRef, connection, tiles, micOn, camOn, screenOn, needsAudioClick, failed, toggle } =
+    useRoom({ url: join.url, token: join.token, startVideo: false, notify, deafened, person: (id, isLocal) => isLocal ? me : person(id) })
+  const connected = connection === ConnectionState.Connected
+
+  useEffect(() => {
+    if (connected) onState({ muted: !micOn, deafened, video: camOn, screen: screenOn })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected, micOn, deafened, camOn, screenOn])
+
+  const speakingKey = tiles.filter((t) => t.kind === 'camera' && t.speaking).map((t) => t.person.id).join(',')
+  useEffect(() => { onSpeaking(speakingKey ? speakingKey.split(',') : []) }, [speakingKey, onSpeaking])
+  useEffect(() => () => onSpeaking([]), [onSpeaking])
+
+  useEffect(() => {
+    const onChange = () => setFullscreen(!!panelRef.current && document.fullscreenElement === panelRef.current)
+    document.addEventListener('fullscreenchange', onChange)
+    return () => document.removeEventListener('fullscreenchange', onChange)
+  }, [])
+
+  async function toggleDeafen() {
+    if (!deafened) {
+      micBeforeDeaf.current = micOn
+      setDeafened(true)
+      if (micOn) await toggle('mic', false)
+    } else {
+      setDeafened(false)
+      if (micBeforeDeaf.current) await toggle('mic', true)
+    }
+  }
+
+  async function toggleMic() {
+    // Unmuting while deafened also brings the sound back, like Discord.
+    if (deafened) { setDeafened(false); await toggle('mic', true); return }
+    await toggle('mic')
+  }
+
+  const reconnecting = connection === ConnectionState.Reconnecting || connection === ConnectionState.SignalReconnecting
+  const headline = failed ? 'Problema na conexão' : reconnecting ? 'Reconectando…' : connected ? 'Voz conectada' : 'Conectando…'
+  const tone = failed ? 'bad' : connected && !reconnecting ? 'ok' : 'wait'
+  const autoFocus = tiles.find((t) => t.kind === 'screen' && !t.isLocal) ?? tiles.find((t) => t.kind === 'screen')
+  const focusedKey = focus === 'grid' ? null : focus && tiles.some((t) => t.key === focus) ? focus : autoFocus?.key ?? null
+  const focusedTile = tiles.find((t) => t.key === focusedKey)
+  const others = tiles.filter((t) => t.key !== focusedKey)
+  const clickTile = (key: string) => setFocus(focusedKey === key ? 'grid' : key)
+  const count = tiles.filter((t) => t.kind === 'camera').length
+  const cols = tiles.length <= 2 ? Math.max(1, tiles.length) : tiles.length <= 4 ? 2 : tiles.length <= 9 ? 3 : 4
+  const rows = Math.ceil(tiles.length / cols)
+  const canShare = typeof navigator !== 'undefined' && !!navigator.mediaDevices && 'getDisplayMedia' in navigator.mediaDevices
+
+  const panel = (
+    <section ref={panelRef} className={`vc-panel voice ${fullscreen ? 'is-fullscreen' : ''}`} aria-label={`Canal de voz ${channelName}`}>
+      <div className="vc-topbar">
+        <span className={`vc-state ${tone}`}><span className="vc-state-dot" />{headline}</span>
+        <span className="vc-clock">{count} {count === 1 ? 'pessoa' : 'pessoas'}</span>
+        <span className="vc-kind"><Icon path={speaker} size={14} /> {channelName}</span>
+      </div>
+      {focusedTile ? (
+        <div className="vc-focus">
+          <div className="vc-stage"><CallTile tile={focusedTile} focused onClick={() => clickTile(focusedTile.key)} /></div>
+          {others.length > 0 && <div className="vc-strip">{others.map((t) => <CallTile key={t.key} tile={t} focused={false} small onClick={() => clickTile(t.key)} />)}</div>}
+        </div>
+      ) : (
+        <div className="vc-grid voice-grid" style={{ '--cols': cols, '--rows': rows } as React.CSSProperties}>
+          {tiles.map((t) => <CallTile key={t.key} tile={t} focused={false} onClick={() => clickTile(t.key)} />)}
+          {connected && count === 1 && <p className="vc-alone">Você é o único aqui. Quem entrar em {channelName} aparece nesta tela.</p>}
+        </div>
+      )}
+      {failed && <p className="vc-problem" role="alert">Não foi possível conectar o áudio e o vídeo ({failed}).</p>}
+      {needsAudioClick && <button type="button" className="vc-audio-unlock" onClick={() => void roomRef.current?.startAudio()}>Clique para ativar o áudio</button>}
+      <div className="vc-controls">
+        <div className="vc-controls-group">
+          <button type="button" className={`vc-btn ${camOn ? 'active' : ''}`} onClick={() => toggle('camera')} aria-pressed={camOn} aria-label={camOn ? 'Desligar câmera' : 'Ligar câmera'} title={camOn ? 'Desligar câmera' : 'Ligar câmera'}><Icon path={camOn ? callIcons.video : callIcons.videoOff} /></button>
+          {canShare && <button type="button" className={`vc-btn ${screenOn ? 'active' : ''}`} onClick={() => toggle('screen')} aria-pressed={screenOn} aria-label={screenOn ? 'Parar de compartilhar a tela' : 'Compartilhar a tela'} title={screenOn ? 'Parar de compartilhar' : 'Compartilhar a tela'}><Icon path={callIcons.screen} /></button>}
+          <button type="button" className={`vc-btn ${micOn ? '' : 'muted'}`} onClick={toggleMic} aria-pressed={!micOn} aria-label={micOn ? 'Desativar microfone' : 'Ativar microfone'} title={micOn ? 'Desativar microfone' : 'Ativar microfone'}><Icon path={micOn ? callIcons.mic : callIcons.micOff} /></button>
+          <button type="button" className={`vc-btn ${deafened ? 'muted' : ''}`} onClick={toggleDeafen} aria-pressed={deafened} aria-label={deafened ? 'Ativar som' : 'Desativar som (ensurdecer)'} title={deafened ? 'Ativar som' : 'Desativar som'}><Icon path={deafened ? headphonesOff : headphones} /></button>
+          <button type="button" className="vc-btn hangup" onClick={onLeave} aria-label="Desconectar do canal de voz" title="Desconectar"><Icon path={callIcons.hangup} /></button>
+        </div>
+        {document.fullscreenEnabled && <button type="button" className="vc-btn vc-fullscreen" onClick={() => document.fullscreenElement ? void document.exitFullscreen() : void panelRef.current?.requestFullscreen?.()} aria-label={fullscreen ? 'Sair da tela cheia' : 'Tela cheia'} title={fullscreen ? 'Sair da tela cheia' : 'Tela cheia'}><Icon path={fullscreen ? 'M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5' : 'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5'} size={20} /></button>}
+      </div>
+    </section>
+  )
+
+  const mini = (
+    <div className="vc-mini voice" role="region" aria-label="Canal de voz conectado">
+      <button type="button" className="vc-mini-info" onClick={onOpen} title={`Abrir ${channelName}`}>
+        <strong className={tone}>{headline}</strong>
+        <span>{channelName} / {guildName}</span>
+      </button>
+      <button type="button" className={`vc-mini-btn ${micOn ? '' : 'muted'}`} onClick={toggleMic} aria-label={micOn ? 'Desativar microfone' : 'Ativar microfone'} title={micOn ? 'Desativar microfone' : 'Ativar microfone'}><Icon path={micOn ? callIcons.mic : callIcons.micOff} size={18} /></button>
+      <button type="button" className={`vc-mini-btn ${deafened ? 'muted' : ''}`} onClick={toggleDeafen} aria-label={deafened ? 'Ativar som' : 'Desativar som'} title={deafened ? 'Ativar som' : 'Desativar som'}><Icon path={deafened ? headphonesOff : headphones} size={18} /></button>
+      <button type="button" className="vc-mini-btn hangup" onClick={onLeave} aria-label="Desconectar do canal de voz" title="Desconectar"><Icon path={callIcons.hangup} size={18} /></button>
     </div>
   )
 
